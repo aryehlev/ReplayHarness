@@ -1,0 +1,95 @@
+# Flows a coding agent wrote after reading buggyapi.go and openapi.yaml.
+# Each one states a behavior the code should have; `why` says what the agent
+# saw in the code. Run them with:
+#
+#   replayharness check examples/buggyapi/flows.yaml --target http://127.0.0.1:8080
+flows:
+  - name: the service reports healthy
+    steps:
+      - method: GET
+        path: /health
+        expect: {status: 200, json: {$.status: ok}}
+
+  - name: a created user can be fetched with the same fields
+    why: createUser stores age as an int, but getUser sends strconv.Itoa(u.Age) (buggyapi.go:118)
+    steps:
+      - method: POST
+        path: /users
+        json: {name: Ada, email: "ada-{{unique}}@example.com", age: 36}
+        expect: {status: 201, json: {$.id: "<integer>", $.age: 36}}
+        save: {id: $.id}
+      - method: GET
+        path: /users/{{id}}
+        expect: {status: 200, json: {$.name: Ada, $.age: 36}}
+
+  - name: a deleted user is gone
+    why: deleteUser answers 204 after the existence check but never removes the user (buggyapi.go:135)
+    steps:
+      - method: POST
+        path: /users
+        json: {name: Temp, email: "temp-{{unique}}@example.com", age: 20}
+        expect: {status: 201}
+        save: {id: $.id}
+      - method: DELETE
+        path: /users/{{id}}
+        expect: {status: 204}
+      - method: GET
+        path: /users/{{id}}
+        expect: {status: 404}
+
+  - name: deleting a user requires a bearer token
+    why: openapi.yaml puts bearerAuth on DELETE /users/{id}; deleteUser never reads Authorization (buggyapi.go:123)
+    steps:
+      - method: POST
+        path: /users
+        json: {name: Keep, email: "keep-{{unique}}@example.com", age: 20}
+        expect: {status: 201}
+        save: {id: $.id}
+      - method: DELETE
+        path: /users/{{id}}
+        no_auth: true
+        expect: {status: [401, 403]}
+
+  - name: a user without an email is rejected
+    why: email is required in NewUser, but createUser reads it with `email, _ :=` and never checks it (buggyapi.go:89)
+    steps:
+      - method: POST
+        path: /users
+        json: {name: NoEmail, age: 30}
+        expect: {status: 400, json: {$.error: "<string>"}}
+
+  - name: age is optional when creating a user
+    why: NewUser only requires name and email, but createUser does body["age"].(float64) unchecked (buggyapi.go:92)
+    steps:
+      - method: POST
+        path: /users
+        json: {name: Young, email: "young-{{unique}}@example.com"}
+        expect: {status: 201}
+
+  - name: a two-letter search works
+    why: search slices q[:3] without checking the length; minLength is 1 (buggyapi.go:150)
+    steps:
+      - method: GET
+        path: /search?q=al
+        expect: {status: 200, json: {$.results: "<array>"}}
+
+  - name: search honors the limit
+    steps:
+      - method: GET
+        path: /search?q=ace&limit=1
+        expect: {status: 200, json: {$.results.length: 1}}
+
+  - name: a zero limit is rejected
+    why: limit is documented as 1..100, but search only checks that it parses (buggyapi.go:148)
+    steps:
+      - method: GET
+        path: /search?q=ace&limit=0
+        expect: {status: 400}
+
+  - name: malformed JSON is rejected
+    steps:
+      - method: POST
+        path: /users
+        body: '{"name": "unterminated'
+        headers: {Content-Type: application/json}
+        expect: {status: 400}

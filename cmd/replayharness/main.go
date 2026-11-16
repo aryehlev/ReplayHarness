@@ -14,15 +14,20 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	replayharness "github.com/aryehlev/ReplayHarness"
+	"github.com/aryehlev/ReplayHarness/internal/agent"
 	"github.com/aryehlev/ReplayHarness/internal/check"
 	"github.com/aryehlev/ReplayHarness/internal/discover"
+	"github.com/aryehlev/ReplayHarness/internal/flow"
 	"github.com/aryehlev/ReplayHarness/internal/generate"
+	"github.com/aryehlev/ReplayHarness/internal/mcp"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 	"github.com/aryehlev/ReplayHarness/internal/record"
 	"github.com/aryehlev/ReplayHarness/internal/report"
@@ -31,34 +36,34 @@ import (
 
 var version = "0.1.0"
 
-const usageText = `ReplayHarness builds requests that try to break your HTTP service, sends
-them, and reports what broke.
+const usageText = `ReplayHarness is a test harness for coding agents. Your agent reads the code,
+writes requests that check what the API should do, and ReplayHarness sends them
+to your local server and reports what broke.
 
-Usage:
-  replayharness scan   <repo|spec|url>                   list the endpoints it finds
-  replayharness gen    <repo|spec|url> [-o file]         write the scenarios without sending them
+With a coding agent:
+  replayharness mcp --target URL [--source .]           serve the tools to an agent (MCP over stdio)
+  replayharness skill [--install]                       print or install the agent playbook
+  replayharness context <repo|spec|url>                 endpoints and handler locations, for an agent
+  replayharness check <flows.yaml|dir> --target URL     run flows (agent-written checks), e.g. in CI
+
+Without an agent:
   replayharness run    <repo|spec|url|scenarios.json> --target URL
-                                                         generate, send and report
-  replayharness record --upstream URL [--listen addr] [-o traffic.jsonl]
-                                                         proxy real traffic and record it
+                                                        generate built-in probes, send them, report
+  replayharness scan   <repo|spec|url>                  list the endpoints it finds
+  replayharness gen    <repo|spec|url> [-o file]        write the probes without sending them
+  replayharness record --upstream URL [-o traffic.jsonl] proxy real traffic and record it
   replayharness replay <traffic.jsonl|file.har> --target URL [--mutate]
-                                                         replay recorded traffic and compare
+                                                        replay recorded traffic and compare
   replayharness version
 
-A source can be a source tree (OpenAPI files and routes in the code are both
-used), an OpenAPI/Swagger file, the URL of a running server (its spec is
-fetched), a scenarios file written by gen, or recorded traffic.
-
-Generated traffic is only sent to localhost and private addresses unless you
-pass --allow-remote. Run it against a server you own, ideally a disposable one:
-scenarios create, change and delete data.
+Requests only go to localhost and private addresses unless you pass
+--allow-remote. Use a server you own, ideally a disposable one: requests
+create, change and delete data.
 
 Examples:
-  replayharness run . --target http://localhost:8080
-  replayharness run http://localhost:8000 -H "Authorization: Bearer $TOKEN"
-  replayharness run ./api --target http://localhost:8080 --baseline http://localhost:9090
-  replayharness record --upstream http://localhost:8080 -o traffic.jsonl
-  replayharness replay traffic.jsonl --target http://localhost:8080 --mutate
+  claude mcp add replayharness -- replayharness mcp --target http://localhost:8080
+  replayharness check .replayharness/flows --target http://localhost:8080
+  replayharness run . --target http://localhost:8080 -H "Authorization: Bearer $TOKEN"
 
 Run "replayharness <command> -h" for the flags of a command.
 `
@@ -81,6 +86,14 @@ func run(args []string) int {
 		return cmdRecord(args[1:])
 	case "replay":
 		return cmdReplay(args[1:])
+	case "context":
+		return cmdContext(args[1:])
+	case "check":
+		return cmdCheck(args[1:])
+	case "mcp":
+		return cmdMCP(args[1:])
+	case "skill":
+		return cmdSkill(args[1:])
 	case "version", "--version", "-version":
 		fmt.Println("replayharness", version)
 		return 0
@@ -676,4 +689,171 @@ func fail(err error) int {
 func isTTY(f *os.File) bool {
 	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func cmdContext(args []string) int {
+	fs := flag.NewFlagSet("context", flag.ContinueOnError)
+	target := fs.String("target", "", "base URL of the server under test (shown to the agent)")
+	format := fs.Bool("with-format", true, "append the flow format reference")
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if len(pos) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: replayharness context <repo|spec|url|traffic.jsonl> [--target URL]")
+		return 2
+	}
+	ctx, cancel := signalContext()
+	defer cancel()
+	var api *model.API
+	if isTraffic(pos[0]) {
+		exs, err := discover.LoadTraffic(pos[0])
+		if err != nil {
+			return fail(err)
+		}
+		api, _ = discover.EndpointsFromTraffic(exs)
+	} else if api, _, err = loadAPI(ctx, pos[0]); err != nil {
+		return fail(err)
+	}
+	fmt.Print(agent.Context(api, *target))
+	if *format {
+		fmt.Printf("\n## Writing flows\n\n%s\n", agent.FlowFormat)
+	}
+	return 0
+}
+
+func cmdCheck(args []string) int {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	var f runFlags
+	f.register(fs)
+	format := fs.String("format", "text", "output format: text or json")
+	pos, err := parseArgs(fs, args)
+	if err != nil {
+		return 2
+	}
+	if len(pos) == 0 || f.target == "" {
+		fmt.Fprintln(os.Stderr, "usage: replayharness check <flows.yaml|dir>... --target URL [-H 'Name: value'] [--format json] [--junit file]")
+		return 2
+	}
+	var flows []flow.Flow
+	for _, p := range pos {
+		fl, err := flow.Load(p)
+		if err != nil {
+			return fail(err)
+		}
+		flows = append(flows, fl...)
+	}
+	if f.dryRun {
+		for _, fl := range flows {
+			unit := "steps"
+			if len(fl.Steps) == 1 {
+				unit = "step"
+			}
+			fmt.Printf("%s (%d %s)\n", fl.Name, len(fl.Steps), unit)
+		}
+		return 0
+	}
+	client, err := runner.NewClient(f.target, runner.Config{
+		Headers: f.headers, AuthHeaders: splitList(f.authHeaders), Rate: f.rate, Timeout: f.timeout,
+		AllowRemote: f.allowRemote, UserAgent: "ReplayHarness/" + version,
+	}, nil)
+	if err != nil {
+		return fail(err)
+	}
+	defer client.Close()
+	ctx, cancel := signalContext()
+	defer cancel()
+	results := (&flow.Runner{Client: client, Headers: f.headers, Slow: f.slow}).Run(ctx, flows)
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.SetEscapeHTML(false)
+		passed, failed := flow.Summary(results)
+		_ = enc.Encode(map[string]any{"target": client.Target(), "passed": passed, "failed": failed, "flows": results})
+	default:
+		flow.WriteText(os.Stdout, results, !f.noColor && os.Getenv("NO_COLOR") == "" && isTTY(os.Stdout))
+	}
+	if f.junitOut != "" {
+		if err := flow.WriteJUnit(f.junitOut, results); err != nil {
+			return fail(err)
+		}
+	}
+	if ctx.Err() != nil {
+		return 130
+	}
+	if _, failed := flow.Summary(results); failed > 0 && f.failOn != "never" {
+		return 1
+	}
+	return 0
+}
+
+func cmdMCP(args []string) int {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	var f runFlags
+	f.register(fs)
+	source := fs.String("source", ".", "what discover reads by default: a source tree, a spec file, recorded traffic, or \"target\" to fetch the spec from the server")
+	if _, err := parseArgs(fs, args); err != nil {
+		return 2
+	}
+	if f.target == "" {
+		fmt.Fprintln(os.Stderr, "usage: replayharness mcp --target http://localhost:8080 [--source .] [-H 'Authorization: Bearer ...']")
+		return 2
+	}
+	if _, err := runner.CheckTarget(f.target, f.allowRemote); err != nil {
+		return fail(err)
+	}
+	ctx, cancel := signalContext()
+	defer cancel()
+	srv := &mcp.Server{
+		Version: version,
+		Source:  *source,
+		Slow:    f.slow,
+		Config: runner.Config{
+			Target: f.target, Headers: f.headers, AuthHeaders: splitList(f.authHeaders), Concurrency: f.concurrency,
+			Rate: f.rate, Timeout: f.timeout, AllowRemote: f.allowRemote, UserAgent: "ReplayHarness/" + version,
+		},
+	}
+	if err := srv.Serve(ctx, os.Stdin, os.Stdout); err != nil && ctx.Err() == nil {
+		return fail(err)
+	}
+	return 0
+}
+
+func cmdSkill(args []string) int {
+	fs := flag.NewFlagSet("skill", flag.ContinueOnError)
+	install := fs.Bool("install", false, "write the skill to .claude/skills/replayharness/SKILL.md in this project")
+	dir := fs.String("dir", ".claude/skills/replayharness", "with --install: the directory to write SKILL.md to (use ~/.claude/skills/replayharness for every project)")
+	if _, err := parseArgs(fs, args); err != nil {
+		return 2
+	}
+	if !*install {
+		fmt.Print(replayharness.Skill)
+		return 0
+	}
+	target := *dir
+	if strings.HasPrefix(target, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fail(err)
+		}
+		target = filepath.Join(home, target[2:])
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return fail(err)
+	}
+	path := filepath.Join(target, "SKILL.md")
+	if err := os.WriteFile(path, []byte(replayharness.Skill), 0o644); err != nil {
+		return fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "Wrote %s\n", path)
+	return 0
+}
+
+func splitList(csv string) []string {
+	var out []string
+	for h := range set(csv) {
+		out = append(out, h)
+	}
+	return out
 }

@@ -1,4 +1,5 @@
-// Package runner sends scenarios to a server and evaluates the responses.
+// Package runner sends requests to the server under test and evaluates the
+// responses.
 package runner
 
 import (
@@ -19,7 +20,7 @@ import (
 	"github.com/aryehlev/ReplayHarness/internal/model"
 )
 
-// DefaultAuthHeaders are left out of scenarios that test missing credentials.
+// DefaultAuthHeaders are left out of requests that test missing credentials.
 var DefaultAuthHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "Api-Key", "X-Auth-Token"}
 
 // Config controls a run.
@@ -60,25 +61,28 @@ func CheckTarget(raw string, allowRemote bool) (*url.URL, error) {
 	}
 	for _, ip := range ips {
 		if !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
-			return nil, fmt.Errorf("refusing to send generated traffic to %s (%s is a public address). "+
+			return nil, fmt.Errorf("refusing to send requests to %s (%s is a public address). "+
 				"ReplayHarness is for servers you run yourself; pass --allow-remote if you own this host", host, ip)
 		}
 	}
 	return u, nil
 }
 
-// Run sends every scenario and returns the results in scenario order. When
-// ctx is cancelled it stops early and returns the results it has.
-func Run(ctx context.Context, cfg Config, suite *model.Suite) ([]model.Result, error) {
-	target, err := CheckTarget(cfg.Target, cfg.AllowRemote)
+// Client sends requests to one target with the configured headers, rate
+// limit and timeout. It is safe for concurrent use.
+type Client struct {
+	base *url.URL
+	cfg  Config
+	http *http.Client
+	auth map[string]bool
+	tick *time.Ticker
+}
+
+// NewClient checks the target and prepares a client for it.
+func NewClient(target string, cfg Config, extraAuth []string) (*Client, error) {
+	base, err := CheckTarget(target, cfg.AllowRemote)
 	if err != nil {
 		return nil, err
-	}
-	var baseline *url.URL
-	if cfg.Baseline != "" {
-		if baseline, err = CheckTarget(cfg.Baseline, cfg.AllowRemote); err != nil {
-			return nil, err
-		}
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 4
@@ -92,58 +96,154 @@ func Run(ctx context.Context, cfg Config, suite *model.Suite) ([]model.Result, e
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = "ReplayHarness"
 	}
-	client := &http.Client{
-		Timeout:       cfg.Timeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		Transport: &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			MaxIdleConnsPerHost: cfg.Concurrency * 2,
-			IdleConnTimeout:     30 * time.Second,
+	c := &Client{
+		base: base,
+		cfg:  cfg,
+		auth: map[string]bool{},
+		http: &http.Client{
+			Timeout:       cfg.Timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConnsPerHost: cfg.Concurrency * 2,
+				IdleConnTimeout:     30 * time.Second,
+			},
 		},
 	}
-	defer client.CloseIdleConnections()
+	for _, list := range [][]string{DefaultAuthHeaders, cfg.AuthHeaders, extraAuth} {
+		for _, h := range list {
+			c.auth[http.CanonicalHeaderKey(h)] = true
+		}
+	}
+	if cfg.Rate > 0 {
+		c.tick = time.NewTicker(time.Duration(float64(time.Second) / cfg.Rate))
+	}
+	return c, nil
+}
 
-	auth := map[string]bool{}
-	for _, h := range DefaultAuthHeaders {
-		auth[http.CanonicalHeaderKey(h)] = true
+// Target returns the base URL requests go to.
+func (c *Client) Target() string { return c.base.String() }
+
+// AuthHeaders returns the header names treated as credentials.
+func (c *Client) AuthHeaders() map[string]bool { return c.auth }
+
+// Close releases the client's resources.
+func (c *Client) Close() {
+	if c.tick != nil {
+		c.tick.Stop()
 	}
-	for _, h := range cfg.AuthHeaders {
-		auth[http.CanonicalHeaderKey(h)] = true
+	c.http.CloseIdleConnections()
+}
+
+func (c *Client) wait(ctx context.Context) bool {
+	if c.tick == nil {
+		return ctx.Err() == nil
 	}
+	select {
+	case <-c.tick.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Do sends one request. stripAuth leaves out the credential headers given in
+// the configuration. A request that never got a response has Status 0.
+func (c *Client) Do(ctx context.Context, r model.Request, stripAuth bool) model.Observed {
+	if !c.wait(ctx) {
+		return model.Observed{Error: "cancelled"}
+	}
+	u := strings.TrimRight(c.base.String(), "/") + r.Path
+	if r.Query != "" {
+		u += "?" + r.Query
+	}
+	body := r.BodyBytes()
+	var rdr io.Reader
+	if len(body) > 0 || headerValue(r.Headers, "Content-Type") != "" {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, u, rdr)
+	if err != nil {
+		return model.Observed{Error: "could not build the request: " + err.Error()}
+	}
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	for k, v := range c.cfg.Headers {
+		if stripAuth && c.auth[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+	for k, v := range r.Headers {
+		req.Header.Set(k, v)
+	}
+
+	start := time.Now()
+	resp, err := c.http.Do(req)
+	if err != nil {
+		obs := model.Observed{DurationMS: ms(time.Since(start)), Error: err.Error()}
+		var ne net.Error
+		obs.Timeout = (errors.As(err, &ne) && ne.Timeout()) || errors.Is(err, context.DeadlineExceeded)
+		return obs
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, c.cfg.MaxBody+1))
+	obs := model.Observed{Status: resp.StatusCode, DurationMS: ms(time.Since(start))}
+	if readErr != nil {
+		obs.Error = readErr.Error()
+	}
+	if int64(len(data)) > c.cfg.MaxBody {
+		data, obs.Truncated = data[:c.cfg.MaxBody], true
+	}
+	obs.Body = string(data)
+	obs.Headers = map[string]string{}
+	for k, v := range resp.Header {
+		obs.Headers[k] = strings.Join(v, ", ")
+	}
+	return obs
+}
+
+func headerValue(h map[string]string, name string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}
+
+// Run sends every scenario and returns the results in scenario order. When
+// ctx is cancelled it stops early and returns the results it has.
+func Run(ctx context.Context, cfg Config, suite *model.Suite) ([]model.Result, error) {
+	var apiAuth []string
 	endpoints := map[string]*model.Endpoint{}
 	if suite.API != nil {
-		for _, h := range suite.API.AuthHeaders {
-			auth[http.CanonicalHeaderKey(h)] = true
-		}
+		apiAuth = suite.API.AuthHeaders
 		for _, ep := range suite.API.Endpoints {
 			endpoints[ep.Key()] = ep
 		}
 	}
-	r := &runner{cfg: cfg, client: client, auth: auth}
-
-	var tick <-chan time.Time
-	if cfg.Rate > 0 {
-		t := time.NewTicker(time.Duration(float64(time.Second) / cfg.Rate))
-		defer t.Stop()
-		tick = t.C
+	target, err := NewClient(cfg.Target, cfg, apiAuth)
+	if err != nil {
+		return nil, err
 	}
-	wait := func() bool {
-		if tick == nil {
-			return ctx.Err() == nil
+	defer target.Close()
+	var baseline *Client
+	if cfg.Baseline != "" {
+		if baseline, err = NewClient(cfg.Baseline, cfg, apiAuth); err != nil {
+			return nil, err
 		}
-		select {
-		case <-tick:
-			return true
-		case <-ctx.Done():
-			return false
-		}
+		defer baseline.Close()
+	}
+	workers := cfg.Concurrency
+	if workers <= 0 {
+		workers = 4
 	}
 
 	results := make([]model.Result, len(suite.Scenarios))
 	jobs := make(chan int)
 	var done atomic.Int64
 	var wg sync.WaitGroup
-	for w := 0; w < cfg.Concurrency; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -154,14 +254,14 @@ func Run(ctx context.Context, cfg Config, suite *model.Suite) ([]model.Result, e
 				if n < 1 {
 					n = 1
 				}
-				for k := 0; k < n && wait(); k++ {
-					res.Observed = append(res.Observed, r.send(ctx, target, sc))
+				for k := 0; k < n && ctx.Err() == nil; k++ {
+					res.Observed = append(res.Observed, target.Do(ctx, sc.Request, sc.StripAuth))
 				}
-				if baseline != nil && len(res.Observed) > 0 && wait() {
-					b := r.send(ctx, baseline, sc)
+				if baseline != nil && ctx.Err() == nil {
+					b := baseline.Do(ctx, sc.Request, sc.StripAuth)
 					res.Baseline = &b
 				}
-				if len(res.Observed) == n && ctx.Err() == nil {
+				if ctx.Err() == nil {
 					res.Findings = check.Evaluate(sc, endpoints[sc.Endpoint], res.Observed, res.Baseline, cfg.Check)
 				} else {
 					res.Observed = nil // interrupted: drop the partial result
@@ -191,62 +291,6 @@ feed:
 		}
 	}
 	return out, ctx.Err()
-}
-
-type runner struct {
-	cfg    Config
-	client *http.Client
-	auth   map[string]bool
-}
-
-func (r *runner) send(ctx context.Context, base *url.URL, sc model.Scenario) model.Observed {
-	u := strings.TrimRight(base.String(), "/") + sc.Request.Path
-	if sc.Request.Query != "" {
-		u += "?" + sc.Request.Query
-	}
-	body := sc.Request.BodyBytes()
-	var rdr io.Reader
-	if len(body) > 0 || sc.Request.Headers["Content-Type"] != "" {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, sc.Request.Method, u, rdr)
-	if err != nil {
-		return model.Observed{Error: "could not build the request: " + err.Error()}
-	}
-	req.Header.Set("User-Agent", r.cfg.UserAgent)
-	for k, v := range r.cfg.Headers {
-		if sc.StripAuth && r.auth[http.CanonicalHeaderKey(k)] {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-	for k, v := range sc.Request.Headers {
-		req.Header.Set(k, v)
-	}
-
-	start := time.Now()
-	resp, err := r.client.Do(req)
-	if err != nil {
-		obs := model.Observed{DurationMS: ms(time.Since(start)), Error: err.Error()}
-		var ne net.Error
-		obs.Timeout = (errors.As(err, &ne) && ne.Timeout()) || errors.Is(err, context.DeadlineExceeded)
-		return obs
-	}
-	defer resp.Body.Close()
-	data, readErr := io.ReadAll(io.LimitReader(resp.Body, r.cfg.MaxBody+1))
-	obs := model.Observed{Status: resp.StatusCode, DurationMS: ms(time.Since(start))}
-	if readErr != nil {
-		obs.Error = readErr.Error()
-	}
-	if int64(len(data)) > r.cfg.MaxBody {
-		data, obs.Truncated = data[:r.cfg.MaxBody], true
-	}
-	obs.Body = string(data)
-	obs.Headers = map[string]string{}
-	for k, v := range resp.Header {
-		obs.Headers[k] = strings.Join(v, ", ")
-	}
-	return obs
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }

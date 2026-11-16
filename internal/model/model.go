@@ -91,6 +91,7 @@ type Endpoint struct {
 	AnyMethod    bool                     `json:"anyMethod,omitempty"`
 	Inferred     bool                     `json:"inferred,omitempty"`
 	Source       string                   `json:"source,omitempty"`
+	Code         string                   `json:"code,omitempty"` // where the route is registered in the source, e.g. api/users.go:42
 	Samples      []Sample                 `json:"samples,omitempty"`
 }
 

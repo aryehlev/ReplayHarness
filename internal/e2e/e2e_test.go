@@ -15,6 +15,7 @@ import (
 	"github.com/aryehlev/ReplayHarness/examples/buggyapi"
 	"github.com/aryehlev/ReplayHarness/internal/check"
 	"github.com/aryehlev/ReplayHarness/internal/discover"
+	"github.com/aryehlev/ReplayHarness/internal/flow"
 	"github.com/aryehlev/ReplayHarness/internal/generate"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 	"github.com/aryehlev/ReplayHarness/internal/report"
@@ -98,5 +99,40 @@ func TestServerSpecDiscovery(t *testing.T) {
 	}
 	if !strings.HasSuffix(found, "/openapi.yaml") || len(api.Endpoints) != 5 {
 		t.Fatalf("found %s with %d endpoints", found, len(api.Endpoints))
+	}
+}
+
+// TestAgentFlows runs the flows an agent would write for the demo API: the
+// ones that describe planted bugs must fail, the rest must pass.
+func TestAgentFlows(t *testing.T) {
+	srv := httptest.NewUnstartedServer(buggyapi.Handler())
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.Start()
+	defer srv.Close()
+
+	flows, err := flow.Load("../../examples/buggyapi/flows.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := runner.NewClient(srv.URL, runner.Config{Timeout: 5 * time.Second}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	results := (&flow.Runner{Client: client}).Run(context.Background(), flows)
+	pass := map[string]bool{
+		"the service reports healthy": true,
+		"search honors the limit":     true,
+		"malformed JSON is rejected":  true,
+	}
+	for _, r := range results {
+		if r.Passed != pass[r.Name] {
+			var b strings.Builder
+			flow.WriteText(&b, []flow.Result{r}, false)
+			t.Errorf("flow %q: passed=%v, want %v\n%s", r.Name, r.Passed, pass[r.Name], b.String())
+		}
+	}
+	if len(results) != 10 {
+		t.Errorf("ran %d flows, want 10", len(results))
 	}
 }

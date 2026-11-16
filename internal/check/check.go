@@ -117,6 +117,36 @@ func Evaluate(sc model.Scenario, ep *model.Endpoint, obs []model.Observed, base 
 
 type addFunc func(check string, sev model.Severity, msg, detail string)
 
+// Basic runs the checks that need no spec: no response, timeouts, 5xx
+// responses (unless allow5xx), leaked stack traces and slow responses.
+func Basic(o model.Observed, allow5xx bool, slow time.Duration) []model.Finding {
+	var out []model.Finding
+	add := func(check string, sev model.Severity, msg, detail string) {
+		out = append(out, model.Finding{Check: check, Severity: sev, Message: msg, Detail: detail})
+	}
+	switch {
+	case o.Status == 0 && o.Timeout:
+		add("timeout", model.SevError, "no response before the timeout", o.Error)
+		return out
+	case o.Status == 0:
+		add("connection", model.SevError, "no response: the server may have crashed or dropped the request", o.Error)
+		return out
+	case o.Error != "":
+		add("connection", model.SevError, "connection dropped while the response body was being read", o.Error)
+	}
+	if o.Status >= 500 && !allow5xx {
+		add("server-error", model.SevError, fmt.Sprintf("returned %d", o.Status), snippet(o.Body))
+	}
+	leak(o, add)
+	if slow > 0 && o.DurationMS > float64(slow.Milliseconds()) {
+		add("slow", model.SevWarning, fmt.Sprintf("slower than %s", slow), fmt.Sprintf("%.0fms", o.DurationMS))
+	}
+	return out
+}
+
+// Snippet trims a response body for display.
+func Snippet(body string) string { return snippet(body) }
+
 func expectation(sc model.Scenario, o model.Observed, what string, add addFunc) {
 	switch sc.Expect {
 	case model.ExpectSuccess:

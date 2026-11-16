@@ -550,7 +550,7 @@ func PathParamNames(path string) []string {
 }
 
 func routeEndpoint(r route) *model.Endpoint {
-	ep := &model.Endpoint{Method: r.method, Path: r.path, Source: r.where, Inferred: true}
+	ep := &model.Endpoint{Method: r.method, Path: r.path, Source: r.where, Code: r.where, Inferred: true}
 	if ep.Method == "" {
 		ep.Method, ep.AnyMethod = "GET", true
 	}
@@ -602,6 +602,7 @@ func computeDrift(api *model.API, routes []route) {
 		for _, r := range routes {
 			if (r.method == "" || r.method == ep.Method) && pathsMatch(ep.Path, r.path) {
 				found = true
+				ep.Code = r.where
 				break
 			}
 		}

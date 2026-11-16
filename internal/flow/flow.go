@@ -1,0 +1,221 @@
+// Package flow runs request flows: short, ordered lists of requests with
+// expectations. A coding agent writes them after reading the handlers, to
+// state what the code should do ("a deleted user is gone", "creating a user
+// without an email is rejected"). Values from one response, such as a new
+// id, can be saved and used by later steps.
+//
+// A flow file is YAML or JSON:
+//
+//	flows:
+//	  - name: a deleted user is gone
+//	    why: deleteUser answers 204 without removing anything (api/users.go:88)
+//	    steps:
+//	      - method: POST
+//	        path: /users
+//	        json: {name: Ada, email: "ada-{{unique}}@example.com"}
+//	        expect: {status: 201}
+//	        save: {id: $.id}
+//	      - {method: DELETE, path: "/users/{{id}}", expect: {status: 204}}
+//	      - {method: GET, path: "/users/{{id}}", expect: {status: 404}}
+package flow
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Flow is a named sequence of requests.
+type Flow struct {
+	Name  string `json:"name" yaml:"name"`
+	Why   string `json:"why,omitempty" yaml:"why,omitempty"` // the behavior being checked and where in the code
+	Steps []Step `json:"steps" yaml:"steps"`
+	File  string `json:"-" yaml:"-"`
+}
+
+// Step is one request and what its response must look like.
+type Step struct {
+	Name    string            `json:"name,omitempty" yaml:"name,omitempty"`
+	Method  string            `json:"method" yaml:"method"`
+	Path    string            `json:"path" yaml:"path"` // may contain a query string and {{variables}}
+	Query   map[string]any    `json:"query,omitempty" yaml:"query,omitempty"`
+	Headers map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	JSON    any               `json:"json,omitempty" yaml:"json,omitempty"` // body, sent as JSON
+	Body    *string           `json:"body,omitempty" yaml:"body,omitempty"` // raw body, sent as is
+	NoAuth  bool              `json:"no_auth,omitempty" yaml:"no_auth,omitempty"`
+	Expect  Expect            `json:"expect,omitempty" yaml:"expect,omitempty"`
+	Save    map[string]string `json:"save,omitempty" yaml:"save,omitempty"` // variable -> $.json.path, header:Name or status
+}
+
+// Expect lists assertions on a response. With no status given, any status
+// below 500 passes.
+type Expect struct {
+	Status      any               `json:"status,omitempty" yaml:"status,omitempty"` // 200, [200, 201], "2xx", "4xx"
+	JSON        map[string]any    `json:"json,omitempty" yaml:"json,omitempty"`     // $.path -> value or matcher
+	Headers     map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	Contains    []string          `json:"contains,omitempty" yaml:"contains,omitempty"`
+	NotContains []string          `json:"not_contains,omitempty" yaml:"not_contains,omitempty"`
+	MaxMS       float64           `json:"max_ms,omitempty" yaml:"max_ms,omitempty"`
+}
+
+// Parse reads flows from YAML or JSON. It accepts {flows: [...]}, a list of
+// flows, or a single flow.
+func Parse(data []byte) ([]Flow, error) {
+	trimmed := bytes.TrimSpace(data)
+	var doc any
+	var err error
+	if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		err = json.Unmarshal(trimmed, &doc)
+	} else {
+		err = yaml.Unmarshal(trimmed, &doc)
+	}
+	if err != nil {
+		return nil, err
+	}
+	doc = normalize(doc)
+	var list any
+	switch t := doc.(type) {
+	case map[string]any:
+		if fl, ok := t["flows"]; ok {
+			list = fl
+		} else {
+			list = []any{t}
+		}
+	case []any:
+		list = t
+	default:
+		return nil, fmt.Errorf("expected flows: [...], a list of flows or one flow")
+	}
+	raw, err := json.Marshal(list)
+	if err != nil {
+		return nil, err
+	}
+	var flows []Flow
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&flows); err != nil {
+		return nil, fmt.Errorf("invalid flow: %w", err)
+	}
+	for i := range flows {
+		if err := flows[i].validate(); err != nil {
+			name := flows[i].Name
+			if name == "" {
+				name = fmt.Sprintf("#%d", i+1)
+			}
+			return nil, fmt.Errorf("flow %s: %w", name, err)
+		}
+	}
+	return flows, nil
+}
+
+func (f *Flow) validate() error {
+	if strings.TrimSpace(f.Name) == "" {
+		return fmt.Errorf("name is required")
+	}
+	if len(f.Steps) == 0 {
+		return fmt.Errorf("at least one step is required")
+	}
+	for i := range f.Steps {
+		s := &f.Steps[i]
+		s.Method = strings.ToUpper(strings.TrimSpace(s.Method))
+		if s.Method == "" {
+			return fmt.Errorf("step %d: method is required", i+1)
+		}
+		if !strings.HasPrefix(s.Path, "/") && !strings.HasPrefix(s.Path, "{{") {
+			return fmt.Errorf("step %d: path must start with / (the target server is set when ReplayHarness starts), got %q", i+1, s.Path)
+		}
+		if s.JSON != nil && s.Body != nil {
+			return fmt.Errorf("step %d: use json or body, not both", i+1)
+		}
+		if _, err := statusMatcher(s.Expect.Status); err != nil {
+			return fmt.Errorf("step %d: %w", i+1, err)
+		}
+		for name, src := range s.Save {
+			if src != "status" && !strings.HasPrefix(src, "$") && !strings.HasPrefix(strings.ToLower(src), "header:") {
+				return fmt.Errorf("step %d: save %s: use a JSON path like $.id, header:Location or status", i+1, name)
+			}
+		}
+	}
+	return nil
+}
+
+// Load reads one flow file, or every .yaml, .yml and .json file in a
+// directory (sorted by name).
+func Load(path string) ([]Flow, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	files := []string{path}
+	if info.IsDir() {
+		files = nil
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			switch strings.ToLower(filepath.Ext(e.Name())) {
+			case ".yaml", ".yml", ".json":
+				if !e.IsDir() {
+					files = append(files, filepath.Join(path, e.Name()))
+				}
+			}
+		}
+		sort.Strings(files)
+		if len(files) == 0 {
+			return nil, fmt.Errorf("no .yaml, .yml or .json flow files in %s", path)
+		}
+	}
+	var all []Flow
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		flows, err := Parse(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+		for i := range flows {
+			flows[i].File = f
+		}
+		all = append(all, flows...)
+	}
+	return all, nil
+}
+
+func normalize(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			t[k] = normalize(val)
+		}
+		return t
+	case map[any]any:
+		m := make(map[string]any, len(t))
+		for k, val := range t {
+			m[fmt.Sprint(k)] = normalize(val)
+		}
+		return m
+	case []any:
+		for i := range t {
+			t[i] = normalize(t[i])
+		}
+		return t
+	}
+	return v
+}
+
+func uniqueID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
