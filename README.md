@@ -79,11 +79,22 @@ $ replayharness check examples/buggyapi/flows.yaml --target http://127.0.0.1:808
 
 ## Set up
 
-**1. Install.** This needs Go 1.22 or newer:
+**1. Install.** It is a single binary with no dependencies, for macOS and Linux:
 
 ```sh
-go install github.com/aryehlev/ReplayHarness/cmd/replayharness@latest
+curl -fsSL https://raw.githubusercontent.com/aryehlev/ReplayHarness/main/install.sh | sh
 ```
+
+The script downloads the binary for your OS and CPU from the
+[latest release](https://github.com/aryehlev/ReplayHarness/releases/latest),
+checks its SHA-256, and puts it in `/usr/local/bin` or `~/.local/bin`.
+
+Or download it yourself from [Releases](https://github.com/aryehlev/ReplayHarness/releases/latest).
+There are builds for macOS, Linux and Windows on amd64 and arm64. If you
+download it with a browser on macOS, clear the quarantine flag once:
+`xattr -d com.apple.quarantine replayharness`.
+
+With Go 1.22 or newer installed, `go install github.com/aryehlev/ReplayHarness/cmd/replayharness@latest` also works.
 
 **2. Start your service locally** with test data, for example on `http://localhost:8080`.
 
@@ -185,7 +196,7 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version: stable }
       - run: docker compose up -d --wait        # your service and its database
-      - run: go install github.com/aryehlev/ReplayHarness/cmd/replayharness@latest
+      - run: curl -fsSL https://raw.githubusercontent.com/aryehlev/ReplayHarness/main/install.sh | REPLAYHARNESS_INSTALL_DIR=/usr/local/bin sudo -E sh
       - run: replayharness check .replayharness/flows --target http://localhost:8080 --junit flows.xml
 ```
 

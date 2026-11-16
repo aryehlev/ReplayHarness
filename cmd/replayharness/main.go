@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,7 +35,18 @@ import (
 	"github.com/aryehlev/ReplayHarness/internal/runner"
 )
 
-var version = "0.1.0"
+// version is set at build time by scripts/release.sh. A "go install" build
+// reports the module version instead.
+var version = "dev"
+
+func init() {
+	if version != "dev" {
+		return
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		version = strings.TrimPrefix(info.Main.Version, "v")
+	}
+}
 
 const usageText = `ReplayHarness is a test harness for coding agents. Your agent reads the code,
 writes requests that check what the API should do, and ReplayHarness sends them
