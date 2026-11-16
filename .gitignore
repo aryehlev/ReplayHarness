@@ -1,0 +1,11 @@
+/replayharness
+/dist/
+*.test
+report.json
+report.xml
+traffic.jsonl
+scenarios.json
+.DS_Store
+
+# Scratch copies made by coding agents
+.claude/worktrees/

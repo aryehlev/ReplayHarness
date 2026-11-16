@@ -1,0 +1,110 @@
+openapi: 3.0.3
+info:
+  title: Buggy Users API
+  version: 1.0.0
+  description: >
+    A small API with deliberate bugs, used by the ReplayHarness demo and tests.
+    The spec is correct; the handlers in buggyapi.go are not.
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string }
+  /users:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewUser" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400":
+          description: Invalid input.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, minimum: 1 }
+    get:
+      responses:
+        "200":
+          description: The user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "404":
+          description: No such user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Deleted. }
+        "401": { description: Missing or invalid token. }
+        "404": { description: No such user. }
+  /search:
+    get:
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 100 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      responses:
+        "200":
+          description: Matching users.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/User" }
+        "400":
+          description: Invalid query.
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  schemas:
+    NewUser:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 50 }
+        email: { type: string, format: email }
+        age: { type: integer, minimum: 0, maximum: 150 }
+    User:
+      allOf:
+        - $ref: "#/components/schemas/NewUser"
+        - type: object
+          required: [id]
+          properties:
+            id: { type: integer }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
