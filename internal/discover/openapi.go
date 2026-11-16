@@ -35,7 +35,10 @@ func ParseSpec(data []byte, origin string) (*model.API, error) {
 		return nil, fmt.Errorf("%s: %w", origin, err)
 	}
 	if !isSpec(doc) {
-		return nil, fmt.Errorf("%s: not an OpenAPI or Swagger document", origin)
+		if isAPIMap(doc) {
+			return parseAPIMap(doc, origin)
+		}
+		return nil, fmt.Errorf("%s: not an OpenAPI or Swagger document, or an API map (a document with endpoints: [...])", origin)
 	}
 	p := &specParser{root: doc, cache: map[string]*model.Schema{}, visiting: map[string]bool{}}
 	_, p.swagger2 = doc["swagger"]

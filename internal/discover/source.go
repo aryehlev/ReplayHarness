@@ -52,8 +52,27 @@ func ScanRepo(root string) (*model.API, error) {
 		}
 	}
 
+	// The API map written by the discovery agent adds handlers and rules to
+	// the spec, or stands in for one.
+	var fromMap map[*model.Endpoint]bool
+	if mf := findMapFile(root); mf != "" {
+		m, err := LoadSpecFile(mf)
+		if err != nil {
+			return nil, err
+		}
+		rel := relPath(root, mf)
+		for _, ep := range m.Endpoints {
+			ep.Source = rel
+		}
+		if specs == 0 && m.Title != "" {
+			api.Title = m.Title
+		}
+		api.Sources = append(api.Sources, rel)
+		fromMap = mergeMap(api, m)
+	}
+
 	routes := scanCode(root)
-	if specs == 0 {
+	if specs == 0 && fromMap == nil {
 		for _, r := range routes {
 			api.Endpoints = append(api.Endpoints, routeEndpoint(r))
 		}
@@ -602,11 +621,15 @@ func computeDrift(api *model.API, routes []route) {
 		for _, r := range routes {
 			if (r.method == "" || r.method == ep.Method) && pathsMatch(ep.Path, r.path) {
 				found = true
-				ep.Code = r.where
+				if ep.Code == "" {
+					ep.Code = r.where
+				}
 				break
 			}
 		}
-		if !found {
+		// A handler the agent located in the code is not drift, even when the
+		// patterns missed its route.
+		if !found && ep.Code == "" {
 			api.Drift = append(api.Drift, model.Drift{Kind: "unimplemented", Method: ep.Method, Path: ep.Path, Where: ep.Source})
 		}
 	}

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,11 +27,11 @@ import (
 	"github.com/aryehlev/ReplayHarness/internal/agent"
 	"github.com/aryehlev/ReplayHarness/internal/check"
 	"github.com/aryehlev/ReplayHarness/internal/discover"
-	"github.com/aryehlev/ReplayHarness/internal/flow"
 	"github.com/aryehlev/ReplayHarness/internal/generate"
 	"github.com/aryehlev/ReplayHarness/internal/mcp"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 	"github.com/aryehlev/ReplayHarness/internal/record"
+	"github.com/aryehlev/ReplayHarness/internal/replay"
 	"github.com/aryehlev/ReplayHarness/internal/report"
 	"github.com/aryehlev/ReplayHarness/internal/runner"
 )
@@ -48,24 +49,29 @@ func init() {
 	}
 }
 
-const usageText = `ReplayHarness is a test harness for coding agents. Your agent reads the code,
-writes requests that check what the API should do, and ReplayHarness sends them
-to your local server and reports what broke.
+const usageText = `ReplayHarness finds bugs in HTTP APIs with coding agents. A discovery agent maps
+the API from the code, with or without an OpenAPI spec. A replay agent writes
+multi-step requests that check what each handler should do, and ReplayHarness
+runs them against your local server.
 
 With a coding agent:
-  replayharness mcp --target URL [--source .]           serve the tools to an agent (MCP over stdio)
-  replayharness skill [--install]                       print or install the agent playbook
-  replayharness context <repo|spec|url>                 endpoints and handler locations, for an agent
-  replayharness check <flows.yaml|dir> --target URL     run flows (agent-written checks), e.g. in CI
+  replayharness mcp --target URL [--source .]        serve the tools to the agents (MCP over stdio)
+  replayharness skill --install [--global]           install the skill and the two agents for Claude Code
+  replayharness skill                                print the playbook for other agents (AGENTS.md)
+  replayharness context <repo|spec|api.yaml|url>     what the agents see: endpoints, handlers, rules
+  replayharness replay <replays.yaml|dir> --target URL
+                                                     run replays the agent wrote
 
 Without an agent:
-  replayharness run    <repo|spec|url|scenarios.json> --target URL
-                                                        generate built-in probes, send them, report
-  replayharness scan   <repo|spec|url>                  list the endpoints it finds
-  replayharness gen    <repo|spec|url> [-o file]        write the probes without sending them
-  replayharness record --upstream URL [-o traffic.jsonl] proxy real traffic and record it
+  replayharness run    <repo|spec|api.yaml|url|scenarios.json> --target URL
+                                                     send the built-in probes and report what broke
+  replayharness scan   <repo|spec|api.yaml|url>      list the endpoints it finds
+  replayharness gen    <repo|spec|api.yaml|url> [-o file]
+                                                     write the probes without sending them
+  replayharness record --upstream URL [-o traffic.jsonl]
+                                                     proxy real traffic and record it
   replayharness replay <traffic.jsonl|file.har> --target URL [--mutate]
-                                                        replay recorded traffic and compare
+                                                     replay recorded traffic and compare
   replayharness version
 
 Requests only go to localhost and private addresses unless you pass
@@ -74,8 +80,8 @@ create, change and delete data.
 
 Examples:
   claude mcp add replayharness -- replayharness mcp --target http://localhost:8080
-  replayharness check .replayharness/flows --target http://localhost:8080
-  replayharness run . --target http://localhost:8080 -H "Authorization: Bearer $TOKEN"
+  replayharness skill --install
+  replayharness replay .replayharness/replays --target http://localhost:8080
 
 Run "replayharness <command> -h" for the flags of a command.
 `
@@ -97,11 +103,18 @@ func run(args []string) int {
 	case "record":
 		return cmdRecord(args[1:])
 	case "replay":
-		return cmdReplay(args[1:])
+		// Recorded traffic is replayed and compared; anything else is a
+		// file or directory of agent-written replays.
+		for _, a := range args[1:] {
+			if isTraffic(a) {
+				return cmdReplay(args[1:])
+			}
+		}
+		return cmdReplays(args[1:])
 	case "context":
 		return cmdContext(args[1:])
-	case "check":
-		return cmdCheck(args[1:])
+	case "check": // the name before 0.2
+		return cmdReplays(args[1:])
 	case "mcp":
 		return cmdMCP(args[1:])
 	case "skill":
@@ -706,7 +719,7 @@ func isTTY(f *os.File) bool {
 func cmdContext(args []string) int {
 	fs := flag.NewFlagSet("context", flag.ContinueOnError)
 	target := fs.String("target", "", "base URL of the server under test (shown to the agent)")
-	format := fs.Bool("with-format", true, "append the flow format reference")
+	format := fs.Bool("with-format", true, "append the replay format reference")
 	pos, err := parseArgs(fs, args)
 	if err != nil {
 		return 2
@@ -729,13 +742,13 @@ func cmdContext(args []string) int {
 	}
 	fmt.Print(agent.Context(api, *target))
 	if *format {
-		fmt.Printf("\n## Writing flows\n\n%s\n", agent.FlowFormat)
+		fmt.Printf("\n## Writing replays\n\n%s\n", agent.ReplayFormat)
 	}
 	return 0
 }
 
-func cmdCheck(args []string) int {
-	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+func cmdReplays(args []string) int {
+	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	var f runFlags
 	f.register(fs)
 	format := fs.String("format", "text", "output format: text or json")
@@ -744,19 +757,19 @@ func cmdCheck(args []string) int {
 		return 2
 	}
 	if len(pos) == 0 || f.target == "" {
-		fmt.Fprintln(os.Stderr, "usage: replayharness check <flows.yaml|dir>... --target URL [-H 'Name: value'] [--format json] [--junit file]")
+		fmt.Fprintln(os.Stderr, "usage: replayharness replay <replays.yaml|dir>... --target URL [-H 'Name: value'] [--format json] [--junit file]\n       replayharness replay <traffic.jsonl|file.har> --target URL [--mutate]")
 		return 2
 	}
-	var flows []flow.Flow
+	var replays []replay.Replay
 	for _, p := range pos {
-		fl, err := flow.Load(p)
+		fl, err := replay.Load(p)
 		if err != nil {
 			return fail(err)
 		}
-		flows = append(flows, fl...)
+		replays = append(replays, fl...)
 	}
 	if f.dryRun {
-		for _, fl := range flows {
+		for _, fl := range replays {
 			unit := "steps"
 			if len(fl.Steps) == 1 {
 				unit = "step"
@@ -775,26 +788,26 @@ func cmdCheck(args []string) int {
 	defer client.Close()
 	ctx, cancel := signalContext()
 	defer cancel()
-	results := (&flow.Runner{Client: client, Headers: f.headers, Slow: f.slow}).Run(ctx, flows)
+	results := (&replay.Runner{Client: client, Headers: f.headers, Slow: f.slow}).Run(ctx, replays)
 	switch *format {
 	case "json":
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		enc.SetEscapeHTML(false)
-		passed, failed := flow.Summary(results)
-		_ = enc.Encode(map[string]any{"target": client.Target(), "passed": passed, "failed": failed, "flows": results})
+		passed, failed := replay.Summary(results)
+		_ = enc.Encode(map[string]any{"target": client.Target(), "passed": passed, "failed": failed, "replays": results})
 	default:
-		flow.WriteText(os.Stdout, results, !f.noColor && os.Getenv("NO_COLOR") == "" && isTTY(os.Stdout))
+		replay.WriteText(os.Stdout, results, !f.noColor && os.Getenv("NO_COLOR") == "" && isTTY(os.Stdout))
 	}
 	if f.junitOut != "" {
-		if err := flow.WriteJUnit(f.junitOut, results); err != nil {
+		if err := replay.WriteJUnit(f.junitOut, results); err != nil {
 			return fail(err)
 		}
 	}
 	if ctx.Err() != nil {
 		return 130
 	}
-	if _, failed := flow.Summary(results); failed > 0 && f.failOn != "never" {
+	if _, failed := replay.Summary(results); failed > 0 && f.failOn != "never" {
 		return 1
 	}
 	return 0
@@ -834,31 +847,44 @@ func cmdMCP(args []string) int {
 
 func cmdSkill(args []string) int {
 	fs := flag.NewFlagSet("skill", flag.ContinueOnError)
-	install := fs.Bool("install", false, "write the skill to .claude/skills/replayharness/SKILL.md in this project")
-	dir := fs.String("dir", ".claude/skills/replayharness", "with --install: the directory to write SKILL.md to (use ~/.claude/skills/replayharness for every project)")
+	install := fs.Bool("install", false, "install the skill and the two agents into .claude/ in this project")
+	global := fs.Bool("global", false, "with --install: install into ~/.claude/ for every project")
+	force := fs.Bool("force", false, "with --install: overwrite files that were changed")
 	if _, err := parseArgs(fs, args); err != nil {
 		return 2
 	}
 	if !*install {
-		fmt.Print(replayharness.Skill)
+		fmt.Print(replayharness.Playbook())
 		return 0
 	}
-	target := *dir
-	if strings.HasPrefix(target, "~/") {
+	root := "."
+	if *global {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return fail(err)
 		}
-		target = filepath.Join(home, target[2:])
+		root = home
 	}
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return fail(err)
+	files := replayharness.AgentFiles()
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
 	}
-	path := filepath.Join(target, "SKILL.md")
-	if err := os.WriteFile(path, []byte(replayharness.Skill), 0o644); err != nil {
-		return fail(err)
+	sort.Strings(names)
+	for _, name := range names {
+		path := filepath.Join(root, name)
+		if old, err := os.ReadFile(path); err == nil && string(old) != files[name] && !*force {
+			fmt.Fprintf(os.Stderr, "Kept %s: it differs from this version (use --force to overwrite)\n", path)
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fail(err)
+		}
+		if err := os.WriteFile(path, []byte(files[name]), 0o644); err != nil {
+			return fail(err)
+		}
+		fmt.Fprintf(os.Stderr, "Wrote %s\n", path)
 	}
-	fmt.Fprintf(os.Stderr, "Wrote %s\n", path)
 	return 0
 }
 

@@ -2,7 +2,7 @@
 // exists so you can watch ReplayHarness find them:
 //
 //	go run ./examples/buggyapi/cmd/buggy-api
-//	replayharness check ./examples/buggyapi/flows.yaml --target http://127.0.0.1:8080
+//	replayharness replay ./examples/buggyapi/replays.yaml --target http://127.0.0.1:8080
 //	replayharness run ./examples/buggyapi --target http://127.0.0.1:8080
 //
 // Every bug is marked with a BUG comment. openapi.yaml describes what the API

@@ -1,6 +1,6 @@
 // Package agent renders what ReplayHarness knows about a service in a form a
 // coding agent can act on: each endpoint's contract and where its handler is
-// registered, so the agent knows which code to read before writing flows.
+// registered, so the agent knows which code to read before writing replays.
 package agent
 
 import (
@@ -11,10 +11,10 @@ import (
 	"github.com/aryehlev/ReplayHarness/internal/model"
 )
 
-// FlowFormat is a short reference for writing flows, shown to agents.
-const FlowFormat = `Flow format (YAML or JSON):
+// ReplayFormat is a short reference for writing replays, shown to agents.
+const ReplayFormat = `Replay format (YAML or JSON):
 
-  flows:
+  replays:
     - name: a deleted user is gone            # the behavior, stated as a fact
       why: deleteUser returns 204 without removing the row (api/users.go:88)
       steps:
@@ -40,7 +40,7 @@ contains / not_contains (body substrings); max_ms.
 save: variable: $.json.path, header:Location or status. Saved values work in
 paths, query values, headers, bodies and expected values ($.id: "{{id}}"); a
 path may be just a saved path (path: "{{location}}").
-Built-in variables: {{unique}} (random per flow run), {{timestamp}} (unix ms).
+Built-in variables: {{unique}} (random per replay run), {{timestamp}} (unix ms).
 Without expect.status any status below 500 passes. A 5xx, a dropped connection,
 a timeout or a leaked stack trace fails a step even when no assertion mentions it.`
 
@@ -56,7 +56,7 @@ func Context(api *model.API, target string) string {
 		fmt.Fprintf(&b, "Discovered from: %s\n", strings.Join(api.Sources, ", "))
 	}
 	if target != "" {
-		fmt.Fprintf(&b, "Requests go to: %s (fixed; paths in flows start with /)\n", target)
+		fmt.Fprintf(&b, "Requests go to: %s (fixed; paths in replays start with /)\n", target)
 	}
 	b.WriteString("\n")
 	for _, ep := range api.Endpoints {
@@ -68,13 +68,15 @@ func Context(api *model.API, target string) string {
 		switch {
 		case ep.Code != "":
 			fmt.Fprintf(&b, "- handler registered at: %s\n", ep.Code)
+		case ep.Inferred && strings.HasSuffix(ep.Source, "routes in source code"):
+			fmt.Fprintf(&b, "- found in the code by pattern matching (%s)\n", ep.Source)
 		case ep.Inferred:
 			fmt.Fprintf(&b, "- seen in: %s\n", ep.Source)
 		default:
 			fmt.Fprintf(&b, "- handler: not found in the code (documented in %s)\n", ep.Source)
 		}
 		if ep.Secured {
-			b.WriteString("- auth: required by the spec\n")
+			b.WriteString("- auth: required\n")
 		}
 		for _, p := range ep.Params {
 			req := ""
@@ -103,13 +105,19 @@ func Context(api *model.API, target string) string {
 			var parts []string
 			for _, c := range codes {
 				rs := ep.Responses[c]
+				part := c
 				if rs.Schema != nil {
-					parts = append(parts, c+" "+Schema(rs.Schema))
-				} else {
-					parts = append(parts, c)
+					part += " " + Schema(rs.Schema)
 				}
+				if rs.Description != "" && rs.Schema == nil {
+					part += " (" + rs.Description + ")"
+				}
+				parts = append(parts, part)
 			}
 			fmt.Fprintf(&b, "- responses: %s\n", strings.Join(parts, "; "))
+		}
+		for _, r := range ep.Rules {
+			fmt.Fprintf(&b, "- rule: %s\n", r)
 		}
 		if len(ep.Samples) > 0 {
 			s := ep.Samples[0]
@@ -132,9 +140,9 @@ func Context(api *model.API, target string) string {
 		b.WriteString("## Spec drift\n")
 		for _, d := range api.Drift {
 			if d.Kind == "undocumented" {
-				fmt.Fprintf(&b, "- %s %s is in the code (%s) but not in the spec\n", d.Method, d.Path, d.Where)
+				fmt.Fprintf(&b, "- %s %s is registered in the code (%s) but neither the spec nor the API map lists it\n", d.Method, d.Path, d.Where)
 			} else {
-				fmt.Fprintf(&b, "- %s %s is in the spec but no route was found in the code\n", d.Method, d.Path)
+				fmt.Fprintf(&b, "- %s %s is listed in %s, but no route for it was found in the code by pattern matching\n", d.Method, d.Path, d.Where)
 			}
 		}
 		b.WriteString("\n")

@@ -66,6 +66,7 @@ type Param struct {
 
 // ResponseSpec is what the spec documents for one response status.
 type ResponseSpec struct {
+	Description string  `json:"description,omitempty"`
 	ContentType string  `json:"contentType,omitempty"`
 	Schema      *Schema `json:"schema,omitempty"`
 }
@@ -93,6 +94,7 @@ type Endpoint struct {
 	Source       string                   `json:"source,omitempty"`
 	Code         string                   `json:"code,omitempty"` // where the route is registered in the source, e.g. api/users.go:42
 	Samples      []Sample                 `json:"samples,omitempty"`
+	Rules        []string                 `json:"rules,omitempty"` // behavior the handler enforces or should, from the API map
 }
 
 // Key identifies the endpoint, e.g. "GET /users/{id}".

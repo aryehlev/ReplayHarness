@@ -1,9 +1,9 @@
-# Flows a coding agent wrote after reading buggyapi.go and openapi.yaml.
+# Replays the replay agent wrote after reading api.yaml and buggyapi.go.
 # Each one states a behavior the code should have; `why` says what the agent
 # saw in the code. Run them with:
 #
-#   replayharness check examples/buggyapi/flows.yaml --target http://127.0.0.1:8080
-flows:
+#   replayharness replay examples/buggyapi/replays.yaml --target http://127.0.0.1:8080
+replays:
   - name: the service reports healthy
     steps:
       - method: GET

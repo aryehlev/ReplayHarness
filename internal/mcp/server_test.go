@@ -107,13 +107,13 @@ func TestTools(t *testing.T) {
 		t.Errorf("a full URL must be refused, got:\n%s", text)
 	}
 
-	text, isErr = s.tool("run_flows", map[string]any{"file": "../../examples/buggyapi/flows.yaml"})
+	text, isErr = s.tool("run_replays", map[string]any{"file": "../../examples/buggyapi/replays.yaml"})
 	if isErr || !strings.Contains(text, "3 passed, 7 failed") {
-		t.Errorf("run_flows:\n%s", text)
+		t.Errorf("run_replays:\n%s", text)
 	}
-	text, isErr = s.tool("run_flows", map[string]any{"flows": "name: x\nsteps: [{method: GET, path: /health, expect: {status: 200}}]"})
+	text, isErr = s.tool("run_replays", map[string]any{"replays": "name: x\nsteps: [{method: GET, path: /health, expect: {status: 200}}]"})
 	if isErr || !strings.Contains(text, "1 passed, 0 failed") {
-		t.Errorf("inline run_flows:\n%s", text)
+		t.Errorf("inline run_replays:\n%s", text)
 	}
 
 	text, isErr = s.tool("probe", map[string]any{"endpoint": "^POST /users$"})

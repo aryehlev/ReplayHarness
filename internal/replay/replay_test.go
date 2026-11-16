@@ -1,4 +1,4 @@
-package flow
+package replay
 
 import (
 	"context"
@@ -15,14 +15,14 @@ import (
 func TestParseShapes(t *testing.T) {
 	one := "name: a\nsteps:\n  - {method: get, path: /x}\n"
 	list := "- name: a\n  steps: [{method: GET, path: /x}]\n- name: b\n  steps: [{method: GET, path: /y}]\n"
-	wrapped := `{"flows": [{"name": "a", "steps": [{"method": "GET", "path": "/x"}]}]}`
+	wrapped := `{"replays": [{"name": "a", "steps": [{"method": "GET", "path": "/x"}]}]}`
 	for in, want := range map[string]int{one: 1, list: 2, wrapped: 1} {
-		flows, err := Parse([]byte(in))
-		if err != nil || len(flows) != want {
-			t.Fatalf("Parse(%q) = %d flows, %v", in, len(flows), err)
+		replays, err := Parse([]byte(in))
+		if err != nil || len(replays) != want {
+			t.Fatalf("Parse(%q) = %d replays, %v", in, len(replays), err)
 		}
-		if flows[0].Steps[0].Method != "GET" {
-			t.Errorf("method not upper-cased: %q", flows[0].Steps[0].Method)
+		if replays[0].Steps[0].Method != "GET" {
+			t.Errorf("method not upper-cased: %q", replays[0].Steps[0].Method)
 		}
 	}
 }
@@ -136,8 +136,8 @@ func TestRunSavesAndReusesValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	flows, err := Parse([]byte(`
-flows:
+	replays, err := Parse([]byte(`
+replays:
   - name: a note can be read back
     steps:
       - method: POST
@@ -152,7 +152,7 @@ flows:
         path: /notes/{{id}}?x={{id}}
         query: {y: "{{id}}"}
         expect: {status: 200}
-  - name: an unknown variable stops the flow
+  - name: an unknown variable stops the replay
     steps:
       - {method: GET, path: "/notes/{{nope}}"}
       - {method: GET, path: /never}
@@ -166,11 +166,11 @@ flows:
 	if err != nil {
 		t.Fatal(err)
 	}
-	results := (&Runner{Client: client}).Run(context.Background(), flows)
+	results := (&Runner{Client: client}).Run(context.Background(), replays)
 	if !results[0].Passed {
 		var b strings.Builder
 		WriteText(&b, results[:1], false)
-		t.Fatalf("flow with saved values failed:\n%s", b.String())
+		t.Fatalf("replay with saved values failed:\n%s", b.String())
 	}
 	if got := results[0].Steps[2].Path; got != "/notes/1?x=1&y=1" {
 		t.Errorf("path with variables = %q", got)

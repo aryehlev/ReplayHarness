@@ -1,97 +1,40 @@
 ---
 name: replayharness
-description: Check that the HTTP API in this project behaves the way its code and docs say, against a running local server. Read the handlers, write request flows that state the expected behavior, run them with the ReplayHarness tools, and save the ones worth keeping as regression tests. Use when the user asks to test, check, find bugs in or harden an API or its endpoints, or after changing API handlers.
+description: Find bugs in the HTTP API in this project by running real requests against a local server, with or without an OpenAPI spec. A discovery agent maps the API from the code, then a replay agent writes and runs multi-step requests that check what each handler should do. Use when the user asks to test, check, find bugs in or harden an API or its endpoints, or after changing API handlers.
 ---
 
-# Checking an API with ReplayHarness
+# Testing an API with ReplayHarness
 
-ReplayHarness sends the requests; you decide what to check. A rule-based tool
-only sees the spec. You can read the handler and notice that `DELETE` never
-deletes, that one user can read another user's orders, or that the page size
-is never capped. Write the request that proves it.
+ReplayHarness works in two steps, each done by its own agent:
 
-Use the `replayharness` MCP tools when they are available (`discover`,
-`send_request`, `run_flows`, `probe`). Otherwise use the CLI:
-`replayharness context .`, `replayharness check <flows> --target URL` and
-`replayharness run . --target URL`.
+1. **Discovery.** The `replayharness-discovery` agent reads the code and
+   writes `.replayharness/api.yaml`: every route with its handler `file:line`,
+   parameters, an example body, required fields, auth, and the rules the
+   handler enforces. It needs no OpenAPI spec.
+2. **Replays.** The `replayharness-replay` agent reads the map and the
+   handlers, writes replays (multi-step requests with expectations) to
+   `.replayharness/replays/`, runs them against the local server, and
+   reports the bugs it confirms.
 
-## Steps
+## What to do
 
-1. **Map the API.** Call `discover` (or `replayharness context .`). Each
-   endpoint comes with its parameters, body schema, documented responses and
-   the `file:line` where its handler is registered. Note any spec drift.
-2. **Get a baseline.** Call `probe`. It sends missing fields, wrong types,
-   values at and past limits, malformed bodies, unusual path and query values,
-   requests without credentials and undefined methods, and reports crashes,
-   5xx errors, accepted invalid input and responses that break the spec.
-3. **Read the handlers.** Open each handler at its `file:line`, follow it into
-   the code it calls, and list the behavior it should have. Look hardest at
-   what a generic probe cannot know:
-   - **State across requests:** create then fetch, update then fetch, delete
-     then fetch, delete twice, create a duplicate.
-   - **Who may do what:** missing credentials, another user's resource, a role
-     without permission. Only use credentials the user gave you.
-   - **Validation the code or docs promise:** required fields, ranges, formats,
-     enums, and what happens with empty strings and nulls.
-   - **Edges:** page sizes of 0, negative values and huge values; the last page;
-     sorting and filtering; very long or unicode input.
-   - **Contract:** status codes, response fields and their types, error
-     bodies, `Location` headers after a create.
-   - **Error paths:** what the handler does when a lookup fails, a parse fails
-     or a downstream call fails.
-4. **Write flows.** Name each one with the behavior as a fact ("a deleted user
-   is gone"). Put your reasoning and the `file:line` in `why`. Save ids with
-   `save: {id: $.id}` and use them as `{{id}}`. Use `{{unique}}` in values that
-   must not collide between runs (emails, usernames). Use `no_auth: true` for a
-   step that must be sent without credentials.
-5. **Run them** with `run_flows`. For each failure, read the code again and
-   decide whether the server is wrong or your expectation is. Fix wrong
-   expectations and rerun. Use `send_request` to look at a response in full.
-6. **Keep the good ones.** Save flows that should keep passing to
-   `.replayharness/flows/<area>.yaml`. Flows that fail because of a real bug
-   can stay as a failing check until the bug is fixed. They run in CI with
-   `replayharness check .replayharness/flows --target URL`.
-7. **Report.** For each bug, give the flow name, the failing step, the curl
-   command, the code location and a suggested fix. Change the code only if
-   the user asked you to.
+1. Check that the `replayharness` MCP tools are available (`discover`,
+   `send_request`, `run_replays`, `probe`) and that the server they point at
+   is running: call `send_request` with a GET to a route you know. If the
+   tools are missing, use the CLI instead: `replayharness context .`,
+   `replayharness replay <dir> --target URL`, `replayharness run . --target URL`.
+   Ask the user for the server's URL if you don't know it.
+2. If `.replayharness/api.yaml` is missing, or the routes changed since it
+   was written, launch the **replayharness-discovery** agent. Wait for its
+   report.
+3. Launch the **replayharness-replay** agent. Give it the discovery report
+   and anything the user asked to focus on.
+4. Tell the user what the replay agent confirmed: each bug with its failing
+   step, `curl` command, code location and suggested fix, and where the
+   replays were saved.
 
-## Flow format
-
-```yaml
-flows:
-  - name: a deleted user is gone
-    why: deleteUser returns 204 but never removes the row (api/users.go:88)
-    steps:
-      - method: POST
-        path: /users
-        json: {name: Ada, email: "ada-{{unique}}@example.com"}
-        expect: {status: 201, json: {$.id: "<integer>", $.name: Ada}}
-        save: {id: $.id}
-      - {method: DELETE, path: "/users/{{id}}", expect: {status: 204}}
-      - {method: GET, path: "/users/{{id}}", expect: {status: 404}}
-```
-
-- Step fields: `method`, `path` (may include `?query`), `query`, `headers`,
-  `json` (a JSON body) or `body` (a raw body), `no_auth`, `expect`, `save`.
-- `expect.status`: `404`, `[200, 201]` or `"4xx"`. Without it, any status
-  below 500 passes.
-- `expect.json`: `$.path: value`, or a matcher: `<exists>` `<absent>` `<null>`
-  `<string>` `<number>` `<integer>` `<bool>` `<array>` `<object>` `<nonempty>`.
-  `$.items.length` gives an array's length. Values compare with their JSON
-  types, so `"36"` does not equal `36`.
-- `expect.headers` (`Location: /users/`, `<exists>`, `<absent>`),
-  `expect.contains`, `expect.not_contains`, `expect.max_ms`.
-- `save`: `$.json.path`, `header:Location` or `status`. Saved values work in
-  paths, query values, headers, bodies and expected values (`$.id: "{{id}}"`).
-  A path may be a saved path on its own (`path: "{{location}}"`).
-- A 5xx, a dropped connection, a timeout or a leaked stack trace fails a step
-  even when no assertion mentions it. A step that expects a 5xx is the exception.
-
-## Rules
-
-- Requests only go to the target ReplayHarness was started with. Do not try to
-  reach other hosts.
-- Requests create, change and delete data. That is fine on the local server
-  you were given. Never point ReplayHarness at production.
-- Do not invent credentials or try to get around authentication. Test with
-  the credentials the user provided, and without any.
+If you cannot launch agents, do both steps yourself, in order, following
+the discovery agent's instructions and then the replay agent's
+(`.claude/agents/replayharness-discovery.md` and
+`.claude/agents/replayharness-replay.md`; `replayharness skill` prints all
+of it as one document).

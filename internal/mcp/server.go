@@ -1,7 +1,7 @@
 // Package mcp serves ReplayHarness to coding agents over the Model Context
 // Protocol (JSON-RPC 2.0 over stdio). The agent reads the code and decides
 // what to check; these tools discover the endpoints, send requests, run
-// flows and run the built-in probes. Every request goes to the one target
+// replays and run the built-in probes. Every request goes to the one target
 // fixed when the server starts.
 package mcp
 
@@ -23,9 +23,9 @@ import (
 	"github.com/aryehlev/ReplayHarness/internal/agent"
 	"github.com/aryehlev/ReplayHarness/internal/check"
 	"github.com/aryehlev/ReplayHarness/internal/discover"
-	"github.com/aryehlev/ReplayHarness/internal/flow"
 	"github.com/aryehlev/ReplayHarness/internal/generate"
 	"github.com/aryehlev/ReplayHarness/internal/model"
+	"github.com/aryehlev/ReplayHarness/internal/replay"
 	"github.com/aryehlev/ReplayHarness/internal/report"
 	"github.com/aryehlev/ReplayHarness/internal/runner"
 )
@@ -44,15 +44,12 @@ type Server struct {
 }
 
 // Instructions are sent to the agent when it connects.
-const Instructions = `ReplayHarness checks the behavior of the HTTP service in this project against a running local server.
-Requests only go to the target configured when the server started; paths start with /.
-Suggested workflow:
-1. discover: list the endpoints and where each handler is registered in the code.
-2. probe: run the built-in requests (missing fields, wrong types, limits, malformed bodies, missing credentials) for a quick baseline.
-3. Read each handler. Write flows that state what the code should do, especially what a generic probe cannot know: state across requests (create, then fetch, update, delete), ownership and permission rules, validation the docs promise, pagination edges, idempotency, error paths.
-4. run_flows. For a failing flow, read the code again to decide whether the server or your expectation is wrong. Fix wrong expectations; report real bugs with the step, the curl command and the code location.
-5. Save the flows that should keep passing to .replayharness/flows/*.yaml so they run in CI with: replayharness check .replayharness/flows --target URL.
-The server may create, change and delete data. Do not try to reach other hosts.`
+const Instructions = `ReplayHarness finds bugs in the HTTP service in this project by sending real requests to a running local server.
+It works in two steps:
+1. Discovery: read the code and write .replayharness/api.yaml, the API map: every route with its handler file:line, parameters, an example body, required fields, auth and the rules the handler enforces. No OpenAPI spec is needed. discover shows what is known so far and validates the map.
+2. Replays: read the map and the handlers, write replays (multi-step requests with expectations) to .replayharness/replays/*.yaml, run them with run_replays, and check each failure against the code before reporting it. probe gives a quick baseline of built-in requests first.
+In Claude Code, the replayharness-discovery and replayharness-replay agents do these steps.
+Requests only go to the target set when ReplayHarness started; paths start with /. Requests may create, change and delete data. Do not try to reach other hosts.`
 
 var protocolVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -181,15 +178,16 @@ func tools() []any {
 	return []any{
 		map[string]any{
 			"name": "discover",
-			"description": "List the service's endpoints: method, path, parameters, body schema, documented responses, whether auth is required, " +
-				"and the file:line where each handler is registered, so you know which code to read. Also reports drift between the spec and the code.",
+			"description": "List the service's endpoints: method, path, parameters, body schema, responses, whether auth is required, the file:line of each handler " +
+				"and the rules from the API map. Reads .replayharness/api.yaml (the API map) and any OpenAPI spec, and finds routes in the code by pattern. " +
+				"Reports routes in the code that the map or spec leave out, and errors in the map. Call it again after editing the map to validate it.",
 			"inputSchema": obj(map[string]any{
-				"source": str("A source tree, an OpenAPI/Swagger file, or recorded traffic (.jsonl/.har). Defaults to the project the server was started for; \"target\" fetches the spec from the running server."),
+				"source": str("A source tree, an API map, an OpenAPI/Swagger file, or recorded traffic (.jsonl/.har). Defaults to the project ReplayHarness was started for; \"target\" fetches the spec from the running server."),
 			}),
 		},
 		map[string]any{
 			"name":        "send_request",
-			"description": "Send one request to the target server and see the full response. Use it to explore before writing flows.",
+			"description": "Send one request to the target server and see the full response. Use it to explore before writing replays.",
 			"inputSchema": obj(map[string]any{
 				"method":  str("HTTP method, e.g. GET"),
 				"path":    str("Path starting with /, may include a query string"),
@@ -201,11 +199,11 @@ func tools() []any {
 			}, "method", "path"),
 		},
 		map[string]any{
-			"name":        "run_flows",
-			"description": "Run request flows: ordered steps with expectations, where values saved from one response ({{id}}) feed later steps. Returns which flows failed, at which step, why, and a curl command per failing step.\n\n" + agent.FlowFormat,
+			"name":        "run_replays",
+			"description": "Run request replays: ordered steps with expectations, where values saved from one response ({{id}}) feed later steps. Returns which replays failed, at which step, why, and a curl command per failing step.\n\n" + agent.ReplayFormat,
 			"inputSchema": obj(map[string]any{
-				"flows": str("Flows as YAML or JSON text"),
-				"file":  str("A flow file or a directory of them, instead of inline flows"),
+				"replays": str("Replays as YAML or JSON text"),
+				"file":    str("A replay file or a directory of them, instead of inline replays"),
 			}),
 		},
 		map[string]any{
@@ -248,7 +246,7 @@ func (s *Server) call(ctx context.Context, name string, args json.RawMessage) (s
 		return text, nil
 	case "send_request":
 		return s.sendRequest(ctx, args)
-	case "run_flows":
+	case "run_replays":
 		return s.runFlows(ctx, args)
 	case "probe":
 		return s.probe(ctx, args)
@@ -290,19 +288,19 @@ func (s *Server) discover(ctx context.Context, source string) (*model.API, error
 }
 
 func (s *Server) sendRequest(ctx context.Context, args json.RawMessage) (string, error) {
-	var step flow.Step
+	var step replay.Step
 	dec := json.NewDecoder(bytes.NewReader(args))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&step); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	f := flow.Flow{Name: "send_request", Steps: []flow.Step{step}}
-	data, _ := json.Marshal([]flow.Flow{f})
-	flows, err := flow.Parse(data)
+	f := replay.Replay{Name: "send_request", Steps: []replay.Step{step}}
+	data, _ := json.Marshal([]replay.Replay{f})
+	replays, err := replay.Parse(data)
 	if err != nil {
 		return "", err
 	}
-	req, err := flow.BuildRequest(flows[0].Steps[0], flow.BuiltinVars())
+	req, err := replay.BuildRequest(replays[0].Steps[0], replay.BuiltinVars())
 	if err != nil {
 		return "", err
 	}
@@ -337,28 +335,28 @@ func (s *Server) sendRequest(ctx context.Context, args json.RawMessage) (string,
 
 func (s *Server) runFlows(ctx context.Context, args json.RawMessage) (string, error) {
 	var a struct {
-		Flows string `json:"flows"`
-		File  string `json:"file"`
+		Replays string `json:"replays"`
+		File    string `json:"file"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	var flows []flow.Flow
+	var replays []replay.Replay
 	var err error
 	switch {
 	case a.File != "":
-		flows, err = flow.Load(a.File)
-	case strings.TrimSpace(a.Flows) != "":
-		flows, err = flow.Parse([]byte(a.Flows))
+		replays, err = replay.Load(a.File)
+	case strings.TrimSpace(a.Replays) != "":
+		replays, err = replay.Parse([]byte(a.Replays))
 	default:
-		return "", fmt.Errorf("pass flows (YAML or JSON text) or file")
+		return "", fmt.Errorf("pass replays (YAML or JSON text) or file")
 	}
 	if err != nil {
 		return "", err
 	}
-	r := &flow.Runner{Client: s.client, Headers: s.Config.Headers, Slow: s.Slow}
+	r := &replay.Runner{Client: s.client, Headers: s.Config.Headers, Slow: s.Slow}
 	var b strings.Builder
-	flow.WriteText(&b, r.Run(ctx, flows), false)
+	replay.WriteText(&b, r.Run(ctx, replays), false)
 	return b.String(), nil
 }
 

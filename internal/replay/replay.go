@@ -1,12 +1,12 @@
-// Package flow runs request flows: short, ordered lists of requests with
+// Package replay runs request replays: short, ordered lists of requests with
 // expectations. A coding agent writes them after reading the handlers, to
 // state what the code should do ("a deleted user is gone", "creating a user
 // without an email is rejected"). Values from one response, such as a new
 // id, can be saved and used by later steps.
 //
-// A flow file is YAML or JSON:
+// A replay file is YAML or JSON:
 //
-//	flows:
+//	replays:
 //	  - name: a deleted user is gone
 //	    why: deleteUser answers 204 without removing anything (api/users.go:88)
 //	    steps:
@@ -17,7 +17,7 @@
 //	        save: {id: $.id}
 //	      - {method: DELETE, path: "/users/{{id}}", expect: {status: 204}}
 //	      - {method: GET, path: "/users/{{id}}", expect: {status: 404}}
-package flow
+package replay
 
 import (
 	"bytes"
@@ -33,8 +33,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Flow is a named sequence of requests.
-type Flow struct {
+// Replay is a named sequence of requests.
+type Replay struct {
 	Name  string `json:"name" yaml:"name"`
 	Why   string `json:"why,omitempty" yaml:"why,omitempty"` // the behavior being checked and where in the code
 	Steps []Step `json:"steps" yaml:"steps"`
@@ -66,9 +66,9 @@ type Expect struct {
 	MaxMS       float64           `json:"max_ms,omitempty" yaml:"max_ms,omitempty"`
 }
 
-// Parse reads flows from YAML or JSON. It accepts {flows: [...]}, a list of
-// flows, or a single flow.
-func Parse(data []byte) ([]Flow, error) {
+// Parse reads replays from YAML or JSON. It accepts {replays: [...]}, a list of
+// replays, or a single replay.
+func Parse(data []byte) ([]Replay, error) {
 	trimmed := bytes.TrimSpace(data)
 	var doc any
 	var err error
@@ -84,7 +84,9 @@ func Parse(data []byte) ([]Flow, error) {
 	var list any
 	switch t := doc.(type) {
 	case map[string]any:
-		if fl, ok := t["flows"]; ok {
+		if fl, ok := t["replays"]; ok {
+			list = fl
+		} else if fl, ok := t["flows"]; ok {
 			list = fl
 		} else {
 			list = []any{t}
@@ -92,31 +94,31 @@ func Parse(data []byte) ([]Flow, error) {
 	case []any:
 		list = t
 	default:
-		return nil, fmt.Errorf("expected flows: [...], a list of flows or one flow")
+		return nil, fmt.Errorf("expected replays: [...], a list of replays or one replay")
 	}
 	raw, err := json.Marshal(list)
 	if err != nil {
 		return nil, err
 	}
-	var flows []Flow
+	var replays []Replay
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&flows); err != nil {
-		return nil, fmt.Errorf("invalid flow: %w", err)
+	if err := dec.Decode(&replays); err != nil {
+		return nil, fmt.Errorf("invalid replay: %w", err)
 	}
-	for i := range flows {
-		if err := flows[i].validate(); err != nil {
-			name := flows[i].Name
+	for i := range replays {
+		if err := replays[i].validate(); err != nil {
+			name := replays[i].Name
 			if name == "" {
 				name = fmt.Sprintf("#%d", i+1)
 			}
-			return nil, fmt.Errorf("flow %s: %w", name, err)
+			return nil, fmt.Errorf("replay %s: %w", name, err)
 		}
 	}
-	return flows, nil
+	return replays, nil
 }
 
-func (f *Flow) validate() error {
+func (f *Replay) validate() error {
 	if strings.TrimSpace(f.Name) == "" {
 		return fmt.Errorf("name is required")
 	}
@@ -147,9 +149,9 @@ func (f *Flow) validate() error {
 	return nil
 }
 
-// Load reads one flow file, or every .yaml, .yml and .json file in a
+// Load reads one replay file, or every .yaml, .yml and .json file in a
 // directory (sorted by name).
-func Load(path string) ([]Flow, error) {
+func Load(path string) ([]Replay, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -171,23 +173,23 @@ func Load(path string) ([]Flow, error) {
 		}
 		sort.Strings(files)
 		if len(files) == 0 {
-			return nil, fmt.Errorf("no .yaml, .yml or .json flow files in %s", path)
+			return nil, fmt.Errorf("no .yaml, .yml or .json replay files in %s", path)
 		}
 	}
-	var all []Flow
+	var all []Replay
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			return nil, err
 		}
-		flows, err := Parse(data)
+		replays, err := Parse(data)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", f, err)
 		}
-		for i := range flows {
-			flows[i].File = f
+		for i := range replays {
+			replays[i].File = f
 		}
-		all = append(all, flows...)
+		all = append(all, replays...)
 	}
 	return all, nil
 }

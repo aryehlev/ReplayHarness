@@ -1,14 +1,15 @@
 # Built-in probes, checks and traffic modes
 
 The `probe` tool and `replayharness run` generate requests from the endpoints
-that discovery finds. Agents use them as a fast baseline before writing flows.
+that discovery finds. The replay agent uses them as a fast baseline before it writes replays.
 They also work on their own, in CI or by hand.
 
 ## Sources
 
 | Source | Example | What is used |
 |---|---|---|
-| Source tree | `replayharness run . --target URL` | OpenAPI/Swagger files in the tree, and routes in the code. A route the spec misses is reported as drift and probed anyway. Without a spec, only the routes in the code are used. |
+| Source tree | `replayharness run . --target URL` | The API map in `.replayharness/api.yaml`, OpenAPI/Swagger files in the tree, and routes in the code. A route that the map and the spec both miss is reported as drift and probed anyway. With neither, only the routes found in the code are used. |
+| API map | `replayharness run .replayharness/api.yaml --target URL` | The endpoints, example bodies, required fields, limits and auth that the discovery agent wrote |
 | Running server | `replayharness run http://localhost:8000` | The spec served at `/openapi.json` (FastAPI), `/v3/api-docs` (Spring), `/swagger.json`, `/swagger/v1/swagger.json` (ASP.NET) and similar places |
 | Spec file | `replayharness run openapi.yaml --target URL` | OpenAPI 3.x or Swagger 2.0, JSON or YAML |
 | Recorded traffic | `replayharness run traffic.jsonl --target URL` | Endpoints, path templates, query parameters and body shapes inferred from real requests (also `.har`) |
@@ -20,9 +21,11 @@ NestJS), Python (FastAPI incl. `APIRouter(prefix=…)`, Flask incl. blueprints,
 Django `urls.py`), Java/Kotlin (Spring), Rust (axum, actix-web, Rocket), Ruby
 (Rails `routes.rb`) and PHP (Laravel).
 
-Without a spec, nothing says what valid input is. So for routes found only in
-code or traffic, guessed rules (a field that was always present, a method that
-was never seen) only count when the server crashes or returns a 5xx.
+For routes found only by pattern or in traffic, nothing says what valid
+input is. So guessed rules, such as a field that was always present or a
+method that was never seen, only count when the server crashes or returns a
+5xx. An API map fixes that: its required fields and limits count like a
+spec's.
 
 ## Probe categories
 

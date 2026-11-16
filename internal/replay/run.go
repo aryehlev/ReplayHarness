@@ -1,4 +1,4 @@
-package flow
+package replay
 
 import (
 	"context"
@@ -47,7 +47,7 @@ func (s StepResult) Failed() bool {
 	return false
 }
 
-// Result is what happened in one flow.
+// Result is what happened in one replay.
 type Result struct {
 	Name   string       `json:"name"`
 	Why    string       `json:"why,omitempty"`
@@ -56,19 +56,19 @@ type Result struct {
 	Steps  []StepResult `json:"steps"`
 }
 
-// Runner runs flows against one target.
+// Runner runs replays against one target.
 type Runner struct {
 	Client  *runner.Client
 	Headers map[string]string // the client's global headers, shown redacted in curl commands
 	Slow    time.Duration
 }
 
-// Run runs the flows one after another. Steps inside a flow run in order;
+// Run runs the replays one after another. Steps inside a replay run in order;
 // a step whose request gets no response, or whose saved value is missing,
-// ends its flow.
-func (r *Runner) Run(ctx context.Context, flows []Flow) []Result {
-	out := make([]Result, 0, len(flows))
-	for _, f := range flows {
+// ends its replay.
+func (r *Runner) Run(ctx context.Context, replays []Replay) []Result {
+	out := make([]Result, 0, len(replays))
+	for _, f := range replays {
 		if ctx.Err() != nil {
 			break
 		}
@@ -77,7 +77,7 @@ func (r *Runner) Run(ctx context.Context, flows []Flow) []Result {
 	return out
 }
 
-func (r *Runner) runOne(ctx context.Context, f Flow) Result {
+func (r *Runner) runOne(ctx context.Context, f Replay) Result {
 	res := Result{Name: f.Name, Why: f.Why, File: f.File, Passed: true}
 	vars := BuiltinVars()
 	for i, st := range f.Steps {
@@ -135,7 +135,7 @@ func (r *Runner) runOne(ctx context.Context, f Flow) Result {
 	return res
 }
 
-// BuiltinVars returns the variables every flow starts with.
+// BuiltinVars returns the variables every replay starts with.
 func BuiltinVars() map[string]any {
 	return map[string]any{"unique": uniqueID(), "timestamp": time.Now().UnixMilli()}
 }
@@ -595,7 +595,7 @@ func scalar(v any) string {
 	return string(b)
 }
 
-// Summary counts passing and failing flows.
+// Summary counts passing and failing replays.
 func Summary(results []Result) (passed, failed int) {
 	for _, r := range results {
 		if r.Passed {
@@ -607,8 +607,8 @@ func Summary(results []Result) (passed, failed int) {
 	return
 }
 
-// WriteText writes results for people and agents: failing flows in full,
-// passing flows as one line each.
+// WriteText writes results for people and agents: failing replays in full,
+// passing replays as one line each.
 func WriteText(w io.Writer, results []Result, color bool) {
 	red, green, dim, bold, reset := "", "", "", "", ""
 	if color {
@@ -663,13 +663,13 @@ func oneLine(s string) string {
 	return s
 }
 
-// WriteJUnit writes one test case per flow.
+// WriteJUnit writes one test case per replay.
 func WriteJUnit(path string, results []Result) error {
 	var b strings.Builder
 	_, failed := Summary(results)
 	b.WriteString(xml.Header)
 	fmt.Fprintf(&b, "<testsuites name=\"replayharness\" tests=\"%d\" failures=\"%d\">\n", len(results), failed)
-	fmt.Fprintf(&b, "  <testsuite name=\"flows\" tests=\"%d\" failures=\"%d\">\n", len(results), failed)
+	fmt.Fprintf(&b, "  <testsuite name=\"replays\" tests=\"%d\" failures=\"%d\">\n", len(results), failed)
 	for _, r := range results {
 		secs := 0.0
 		for _, s := range r.Steps {
@@ -677,7 +677,7 @@ func WriteJUnit(path string, results []Result) error {
 		}
 		class := r.File
 		if class == "" {
-			class = "flows"
+			class = "replays"
 		}
 		fmt.Fprintf(&b, "    <testcase name=%s classname=%s time=\"%.3f\"", attr(r.Name), attr(class), secs)
 		if r.Passed {
@@ -686,14 +686,14 @@ func WriteJUnit(path string, results []Result) error {
 		}
 		var text strings.Builder
 		WriteText(&text, []Result{r}, false)
-		first := "flow failed"
+		first := "replay failed"
 		for _, s := range r.Steps {
 			if s.Failed() {
 				first = fmt.Sprintf("step %d: %s %s", s.Index, s.Method, s.Path)
 				break
 			}
 		}
-		b.WriteString(">\n      <failure message=" + attr(first) + " type=\"flow\">")
+		b.WriteString(">\n      <failure message=" + attr(first) + " type=\"replay\">")
 		_ = xml.EscapeText(&b, []byte(text.String()))
 		b.WriteString("</failure>\n    </testcase>\n")
 	}

@@ -1,0 +1,81 @@
+# The API map a discovery agent wrote for this service by reading
+# buggyapi.go, without looking at openapi.yaml. In a project it lives at
+# .replayharness/api.yaml, where ReplayHarness picks it up on its own.
+#
+#   replayharness context examples/buggyapi/api.yaml
+#   replayharness run examples/buggyapi/api.yaml --target http://127.0.0.1:8080
+name: Buggy Users API
+notes:
+  - Users live in memory, seeded with ids 1-3 (buggyapi.go:40). Ids are assigned as len(users)+1.
+  - POST /users, GET /users/{id} and DELETE /users/{id} are wrapped in debugErrors, which turns a panic into a 500 with the stack trace in the body (buggyapi.go:65). GET /search has no wrapper, so a panic there drops the connection.
+  - No route checks credentials.
+endpoints:
+  - method: GET
+    path: /health
+    handler: buggyapi.go:50
+    responses: {"200": '{"status": "ok"}'}
+
+  - method: POST
+    path: /users
+    handler: buggyapi.go:78
+    body:
+      example: {name: Ada Lovelace, email: ada@example.com, age: 36}
+      required: [name, email]
+      fields:
+        name: {min_length: 1, max_length: 50}
+        email: {format: email}
+        age: {type: integer, min: 0, max: 150}
+    responses:
+      "201": the created user {id, name, email, age}
+      "400": invalid JSON, missing name, or age outside 0-150
+    rules:
+      - name must be a non-empty string (buggyapi.go:85)
+      - email is read with `email, _ :=` and never checked; a user without an email should be rejected (buggyapi.go:91)
+      - age is optional, but body["age"].(float64) is an unchecked type assertion (buggyapi.go:93)
+      - age must be 0-150 (buggyapi.go:94)
+
+  - method: GET
+    path: /users/{id}
+    handler: buggyapi.go:105
+    params:
+      - {name: id, in: path, example: 1, type: integer}
+    responses:
+      "200": the user {id, name, email, age}
+      "400": id is not an integer
+      "404": no such user
+    rules:
+      - ids above the last user give 404, but id < 1 indexes users[id-1] without a check (buggyapi.go:113-117)
+      - age is returned as strconv.Itoa(u.Age), a string, while POST /users returns it as a number (buggyapi.go:119)
+
+  - method: DELETE
+    path: /users/{id}
+    handler: buggyapi.go:122
+    auth: true
+    params:
+      - {name: id, in: path, example: 3, type: integer}
+    responses:
+      "204": deleted
+      "404": no such user
+    rules:
+      - deleting is destructive and should need credentials, but the handler never reads Authorization (buggyapi.go:123)
+      - answers 204 after the existence check without removing the user from s.users (buggyapi.go:135)
+
+  - method: GET
+    path: /search
+    handler: buggyapi.go:139
+    params:
+      - {name: q, in: query, required: true, example: ada, type: string, min_length: 1, max_length: 100}
+      - {name: limit, in: query, example: 10, type: integer, min: 1, max: 100}
+    responses:
+      "200": '{"results": [users whose name contains the first 3 letters of q]}'
+      "400": limit is not an integer
+    rules:
+      - q[:3] is taken without a length check, so q shorter than 3 characters panics (buggyapi.go:150)
+      - limit is parsed but never range-checked; a negative limit panics at results[:limit] (buggyapi.go:148, 160)
+
+  - method: GET
+    path: /admin/stats
+    handler: buggyapi.go:165
+    responses: {"200": '{"users": <count>}'}
+    rules:
+      - an admin route with no auth check at all (buggyapi.go:59)
