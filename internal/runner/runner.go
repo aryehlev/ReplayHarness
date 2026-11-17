@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/aryehlev/ReplayHarness/internal/check"
+	"github.com/aryehlev/ReplayHarness/internal/grpcx"
 	"github.com/aryehlev/ReplayHarness/internal/model"
+	"github.com/aryehlev/ReplayHarness/internal/wsx"
 )
 
 // DefaultAuthHeaders are left out of requests that test missing credentials.
@@ -26,6 +28,8 @@ var DefaultAuthHeaders = []string{"Authorization", "Proxy-Authorization", "Cooki
 // Config controls a run.
 type Config struct {
 	Target      string
+	GRPCTarget  string            // host:port of the gRPC server, if it is not the HTTP target
+	Protos      []string          // .proto files or directories with the gRPC message types
 	Baseline    string            // optional second server to compare against
 	Headers     map[string]string // sent with every request (for example credentials)
 	AuthHeaders []string          // extra header names that carry credentials
@@ -39,33 +43,67 @@ type Config struct {
 	Progress    func(done, total int)
 }
 
+// SplitTarget accepts an http(s):// URL, or a grpc(s):// URL for a service
+// that only speaks gRPC, and returns the HTTP base URL and the gRPC target
+// (empty unless the target was grpc://).
+func SplitTarget(raw string) (httpTarget, grpcTarget string) {
+	switch {
+	case strings.HasPrefix(raw, "grpc://"):
+		return "http://" + strings.TrimPrefix(raw, "grpc://"), raw
+	case strings.HasPrefix(raw, "grpcs://"):
+		return "https://" + strings.TrimPrefix(raw, "grpcs://"), raw
+	}
+	return raw, ""
+}
+
 // CheckTarget refuses targets outside loopback and private networks unless
 // allowRemote is set. Generated traffic is meant for servers you run.
 func CheckTarget(raw string, allowRemote bool) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("target %q must be an http:// or https:// URL", raw)
+		return nil, fmt.Errorf("target %q must be an http:// or https:// URL (or grpc://host:port for a gRPC server)", raw)
 	}
 	if allowRemote {
 		return u, nil
 	}
-	host := u.Hostname()
+	if err := CheckHost(u.Hostname()); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// CheckGRPCTarget applies the same rule to a gRPC host:port.
+func CheckGRPCTarget(raw string, allowRemote bool) error {
+	addr, _, err := grpcx.ParseTarget(raw)
+	if err != nil {
+		return err
+	}
+	if allowRemote {
+		return nil
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	return CheckHost(host)
+}
+
+// CheckHost refuses public hosts.
+func CheckHost(host string) error {
+	var err error
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return u, nil
+		return nil
 	}
 	ips := []net.IP{net.ParseIP(host)}
 	if ips[0] == nil {
 		if ips, err = net.LookupIP(host); err != nil {
-			return nil, fmt.Errorf("resolve %s: %w", host, err)
+			return fmt.Errorf("resolve %s: %w", host, err)
 		}
 	}
 	for _, ip := range ips {
 		if !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
-			return nil, fmt.Errorf("refusing to send requests to %s (%s is a public address). "+
+			return fmt.Errorf("refusing to send requests to %s (%s is a public address). "+
 				"ReplayHarness is for servers you run yourself; pass --allow-remote if you own this host", host, ip)
 		}
 	}
-	return u, nil
+	return nil
 }
 
 // Client sends requests to one target with the configured headers, rate
@@ -76,13 +114,26 @@ type Client struct {
 	http *http.Client
 	auth map[string]bool
 	tick *time.Ticker
+
+	grpcOnce sync.Once
+	grpc     *grpcx.Client
+	grpcErr  error
 }
 
 // NewClient checks the target and prepares a client for it.
 func NewClient(target string, cfg Config, extraAuth []string) (*Client, error) {
+	target, fromTarget := SplitTarget(target)
+	if cfg.GRPCTarget == "" {
+		cfg.GRPCTarget = fromTarget
+	}
 	base, err := CheckTarget(target, cfg.AllowRemote)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.GRPCTarget != "" {
+		if err := CheckGRPCTarget(cfg.GRPCTarget, cfg.AllowRemote); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 4
@@ -124,6 +175,32 @@ func NewClient(target string, cfg Config, extraAuth []string) (*Client, error) {
 // Target returns the base URL requests go to.
 func (c *Client) Target() string { return c.base.String() }
 
+// GRPCAddr returns the host:port gRPC calls go to: the gRPC target, or the
+// HTTP target's host when none was given.
+func (c *Client) GRPCAddr() string {
+	if c.cfg.GRPCTarget != "" {
+		if addr, _, err := grpcx.ParseTarget(c.cfg.GRPCTarget); err == nil {
+			return addr
+		}
+	}
+	return c.base.Host
+}
+
+// GRPC returns the gRPC client, creating it on first use.
+func (c *Client) GRPC() (*grpcx.Client, error) {
+	c.grpcOnce.Do(func() {
+		target := c.cfg.GRPCTarget
+		if target == "" {
+			target = c.base.Host
+			if c.base.Scheme == "https" {
+				target = "grpcs://" + target
+			}
+		}
+		c.grpc, c.grpcErr = grpcx.New(target, c.cfg.Protos, c.cfg.Timeout, int(c.cfg.MaxBody))
+	})
+	return c.grpc, c.grpcErr
+}
+
 // AuthHeaders returns the header names treated as credentials.
 func (c *Client) AuthHeaders() map[string]bool { return c.auth }
 
@@ -133,6 +210,9 @@ func (c *Client) Close() {
 		c.tick.Stop()
 	}
 	c.http.CloseIdleConnections()
+	if c.grpc != nil {
+		c.grpc.Close()
+	}
 }
 
 func (c *Client) wait(ctx context.Context) bool {
@@ -152,6 +232,35 @@ func (c *Client) wait(ctx context.Context) bool {
 func (c *Client) Do(ctx context.Context, r model.Request, stripAuth bool) model.Observed {
 	if !c.wait(ctx) {
 		return model.Observed{Error: "cancelled"}
+	}
+	switch r.Protocol {
+	case model.ProtoGRPC:
+		g, err := c.GRPC()
+		if err != nil {
+			return model.Observed{Unsent: err.Error()}
+		}
+		md := map[string]string{}
+		for k, v := range c.cfg.Headers {
+			if !(stripAuth && c.auth[http.CanonicalHeaderKey(k)]) {
+				md[k] = v
+			}
+		}
+		for k, v := range r.Headers {
+			md[k] = v
+		}
+		return g.Invoke(ctx, r, md)
+	case model.ProtoWebSocket:
+		h := http.Header{}
+		h.Set("User-Agent", c.cfg.UserAgent)
+		for k, v := range c.cfg.Headers {
+			if !(stripAuth && c.auth[http.CanonicalHeaderKey(k)]) {
+				h.Set(k, v)
+			}
+		}
+		for k, v := range r.Headers {
+			h.Set(k, v)
+		}
+		return wsx.Do(ctx, c.http, c.base, r, h, c.cfg.Timeout, c.cfg.MaxBody)
 	}
 	u := strings.TrimRight(c.base.String(), "/") + r.Path
 	if r.Query != "" {
@@ -286,7 +395,9 @@ feed:
 
 	out := results[:0]
 	for _, res := range results {
-		if len(res.Observed) > 0 {
+		// A probe that could not be built for the protocol (a value that does
+		// not fit a protobuf type) was never sent.
+		if len(res.Observed) > 0 && res.Observed[0].Unsent == "" {
 			out = append(out, res)
 		}
 	}

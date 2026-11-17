@@ -14,6 +14,9 @@ They also work on their own, in CI or by hand.
 | Spec file | `replayharness run openapi.yaml --target URL` | OpenAPI 3.x or Swagger 2.0, JSON or YAML |
 | Recorded traffic | `replayharness run traffic.jsonl --target URL` | Endpoints, path templates, query parameters and body shapes inferred from real requests (also `.har`) |
 | Scenarios file | `replayharness run scenarios.json --target URL` | Probes written earlier by `replayharness gen` |
+| `.proto` files | `replayharness run . --target URL --grpc host:port` | gRPC services and their messages, with `field_behavior` REQUIRED fields, oneofs and enums. `--proto` adds files or directories outside the tree. Vendored protos (`vendor/`, `third_party/`) are used for imports only. |
+| gRPC reflection | `replayharness run grpc://localhost:9090` | Services the server lists by reflection (v1, or v1alpha), when there are no `.proto` files |
+| GraphQL schema | `replayharness run . --target URL` | Queries and mutations from `.graphql`/`.graphqls`/`.gql` files and `gql` literals in JS/TS, or from introspection of the running server. Each root field is one endpoint. |
 
 Routes are found in Go (net/http incl. Go 1.22 patterns, gorilla/mux, gin,
 echo, chi, fiber), JavaScript/TypeScript (Express, Koa routers, Fastify, Hono,
@@ -50,6 +53,25 @@ and defaults where there are any, and then variants that each break one thing:
 | `consistency` | the same GET twice | answers the same way twice |
 | `replay` | recorded requests | answers like it did when recorded |
 
+### Other protocols
+
+* **gRPC:** the same body categories apply to the request message, minus
+  wrong types protobuf's JSON parser rejects before sending (those are
+  dropped), plus an enum number that is not defined and an empty message.
+  A code counts as its HTTP equivalent: `INVALID_ARGUMENT` is a 400,
+  `NOT_FOUND` a 404, `INTERNAL`, `UNKNOWN` and `DATA_LOSS` a 500,
+  `UNAVAILABLE` a 503.
+* **GraphQL:** the body categories apply to the variables. `body-shape`
+  sends `{}`, a query that is a number, malformed JSON, a query that does
+  not parse, an unknown field, an unknown `operationName`, a batch, and a
+  `text/plain` body; `{ __typename }` must succeed. `method` sends each
+  mutation with GET, which must not run.
+* **WebSocket:** the body categories apply to the first message, plus
+  malformed JSON, an empty message, plain text, an unknown message type
+  and a message of 1 MiB. Only a crash counts: a close with 1011, or a
+  connection dropped without a close frame. The handshake is checked like
+  a GET, including without credentials.
+
 To narrow a run:
 * `--only` and `--skip` choose categories.
 * `--endpoint` filters endpoints by a regular expression.
@@ -61,7 +83,7 @@ To narrow a run:
 
 | Check | Severity | Meaning |
 |---|---|---|
-| `server-error` | error | a 5xx response |
+| `server-error` | error | a 5xx response, gRPC `INTERNAL`/`UNKNOWN`/`DATA_LOSS`, a GraphQL error that looks like a crash, or a WebSocket closed with 1011 |
 | `connection` / `timeout` | error | the server dropped the connection or never answered, usually a crash |
 | `auth-bypass` | error | a secured endpoint answered 2xx without valid credentials |
 | `accepted-invalid` | error or warning | invalid input got a 2xx. It is an error when the spec's own rule was broken (a missing required field, a value outside the enum), otherwise a warning. |
@@ -71,13 +93,14 @@ To narrow a run:
 | `undocumented-status` | warning | a status code the spec doesn't list for the endpoint |
 | `error-leak` | warning | a stack trace or database error in the body (Python, Go, JVM, Node, .NET, Ruby, PHP, SQL) |
 | `undefined-method` | warning | a method the path doesn't define answered 2xx |
+| `get-mutation` | error | a GraphQL mutation sent with GET ran |
 | `content-type` | warning | a JSON response served with another content type |
 | `slow` | warning | slower than `--slow` (default 2s) |
 | `inconsistent` | warning | the same GET answered differently twice |
 | `rejected-valid` | warning or note | the valid request was refused. A 401, 403 or 404 is only a note, since it usually means missing credentials or seed data. |
 
 Identical findings on one endpoint are grouped and counted, each with a `curl`
-command that reproduces it. The exit status is 1 when there are errors.
+(or `grpcurl`, or `websocat`) command that reproduces it. The exit status is 1 when there are errors.
 `--fail-on warning` makes warnings fail the run too, and `--fail-on never`
 always exits 0. `--json` writes the full report, and `--junit` writes one test
 case per probe.

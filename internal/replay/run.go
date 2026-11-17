@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/aryehlev/ReplayHarness/internal/check"
+	"github.com/aryehlev/ReplayHarness/internal/gql"
+	"github.com/aryehlev/ReplayHarness/internal/grpcx"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 	"github.com/aryehlev/ReplayHarness/internal/report"
 	"github.com/aryehlev/ReplayHarness/internal/runner"
@@ -27,6 +29,9 @@ type StepResult struct {
 	Method   string          `json:"method"`
 	Path     string          `json:"path"`
 	Status   int             `json:"status,omitempty"`
+	Code     string          `json:"code,omitempty"`  // gRPC status code
+	Close    int             `json:"close,omitempty"` // WebSocket close code
+	Outcome  string          `json:"outcome"`         // the status as shown: 404, NOT_FOUND, "101, closed 1008", "no response"
 	MS       float64         `json:"ms"`
 	Failures []string        `json:"failures,omitempty"`
 	Findings []model.Finding `json:"findings,omitempty"`
@@ -88,23 +93,31 @@ func (r *Runner) runOne(ctx context.Context, f Replay) Result {
 			res.Steps, res.Passed = append(res.Steps, sr), false
 			break
 		}
-		sr.Path = req.Path
-		if req.Query != "" {
-			sr.Path += "?" + req.Query
-		}
-		sr.Curl = report.Curl(report.Options{Target: r.Client.Target(), Headers: r.Headers, AuthHeaders: r.Client.AuthHeaders()},
+		sr.Method, sr.Path = display(st, req)
+		sr.Curl = report.Command(report.Options{Target: r.Client.Target(), GRPCTarget: r.Client.GRPCAddr(), Headers: r.Headers, AuthHeaders: r.Client.AuthHeaders()},
 			model.Scenario{Request: req, StripAuth: st.NoAuth})
 
 		obs := r.Client.Do(ctx, req, st.NoAuth)
-		sr.Status, sr.MS = obs.Status, obs.DurationMS
-		match, _ := statusMatcher(st.Expect.Status)
-		sr.Findings = check.Basic(obs, obs.Status >= 500 && match != nil && match(obs.Status), r.Slow)
+		sr.Status, sr.Code, sr.Close, sr.MS, sr.Outcome = obs.Status, obs.Code, obs.Close, obs.DurationMS, obs.StatusText()
+		if obs.Unsent != "" {
+			sr.Failures = append(sr.Failures, "not sent: "+obs.Unsent)
+			sr.Outcome = "not sent"
+			res.Steps, res.Passed = append(res.Steps, sr), false
+			break
+		}
+		sr.Findings = check.Basic(obs, req.Protocol, expects5xx(st.Expect, obs), r.Slow)
 		stop := obs.Status == 0
 		if !stop {
 			if exp, err := expandExpect(st.Expect, vars); err != nil {
 				sr.Failures = append(sr.Failures, "expect: "+err.Error())
 			} else {
 				sr.Failures = append(sr.Failures, assertResponse(exp, obs)...)
+				if req.Protocol == model.ProtoGraphQL && !mentionsErrors(exp.JSON) {
+					if msgs, internal, ok := gql.Errors(obs.Body); ok && len(msgs) > 0 && len(internal) == 0 {
+						sr.Failures = append(sr.Failures, "the response has GraphQL errors: "+strings.Join(msgs, "; ")+
+							" (expect $.errors if the request should fail)")
+					}
+				}
 			}
 			names := make([]string, 0, len(st.Save))
 			for n := range st.Save {
@@ -133,6 +146,66 @@ func (r *Runner) runOne(ctx context.Context, f Replay) Result {
 		}
 	}
 	return res
+}
+
+// display names a step for the report: the method and path, "gRPC" and the
+// method, "GraphQL" and the root field, or "WS" and the path.
+func display(st Step, req model.Request) (string, string) {
+	path := req.Path
+	if req.Query != "" {
+		path += "?" + req.Query
+	}
+	switch req.Protocol {
+	case model.ProtoGRPC:
+		return "gRPC", strings.TrimPrefix(req.Path, "/")
+	case model.ProtoGraphQL:
+		if f := firstField(st.GraphQL); f != "" {
+			return "GraphQL", f
+		}
+		return "GraphQL", path
+	case model.ProtoWebSocket:
+		return "WS", path
+	}
+	return req.Method, path
+}
+
+var opRe = regexp.MustCompile(`^\s*(query|mutation|subscription)?[^{]*\{\s*(?:\w+\s*:\s*)?(\w+)`)
+
+// firstField returns "query user" for "query ($id: ID!) { user(id: $id) { name } }".
+func firstField(q string) string {
+	m := opRe.FindStringSubmatch(q)
+	if m == nil {
+		return ""
+	}
+	op := m[1]
+	if op == "" {
+		op = "query"
+	}
+	return op + " " + m[2]
+}
+
+// expects5xx reports whether the step expects the server-side failure it
+// got, so it is not reported on its own.
+func expects5xx(e Expect, o model.Observed) bool {
+	if match, _ := statusMatcher(e.Status); match != nil && match(o.Status) && o.Status >= 500 {
+		return true
+	}
+	if match, _ := codeMatcher(e.Code); match != nil && o.Code != "" && match(o.Code) && o.Status >= 500 {
+		return true
+	}
+	if match, _ := closeMatcher(e.Close); match != nil && o.Close != 0 && match(o.Close) {
+		return true
+	}
+	return false
+}
+
+func mentionsErrors(json map[string]any) bool {
+	for p := range json {
+		if strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(p), "$."), "errors") {
+			return true
+		}
+	}
+	return false
 }
 
 // BuiltinVars returns the variables every replay starts with.
@@ -240,48 +313,7 @@ func expandExpect(e Expect, vars map[string]any) (Expect, error) {
 
 // BuildRequest turns a step into a request, filling in saved variables.
 func BuildRequest(st Step, vars map[string]any) (model.Request, error) {
-	req := model.Request{Method: st.Method, Headers: map[string]string{}}
-	raw := st.Path
-	// A path that starts with a saved path (e.g. a Location header) uses it as is.
-	if m := varRe.FindStringSubmatchIndex(raw); m != nil && m[0] == 0 {
-		if v, ok := vars[raw[m[2]:m[3]]]; ok && strings.HasPrefix(scalar(v), "/") {
-			raw = scalar(v) + raw[m[1]:]
-		}
-	}
-	path, rawQuery, _ := strings.Cut(raw, "?")
-	p, err := substitute(path, vars, url.PathEscape)
-	if err != nil {
-		return req, err
-	}
-	if !strings.HasPrefix(p, "/") {
-		return req, fmt.Errorf("path %q does not start with / after filling in variables; requests can only go to the configured target", p)
-	}
-	req.Path = p
-	q, err := substitute(rawQuery, vars, url.QueryEscape)
-	if err != nil {
-		return req, err
-	}
-	if len(st.Query) > 0 {
-		vals := url.Values{}
-		for k, v := range st.Query {
-			items, ok := v.([]any)
-			if !ok {
-				items = []any{v}
-			}
-			for _, item := range items {
-				s, err := substitute(scalar(item), vars, nil)
-				if err != nil {
-					return req, err
-				}
-				vals.Add(k, s)
-			}
-		}
-		if q != "" {
-			q += "&"
-		}
-		q += vals.Encode()
-	}
-	req.Query = q
+	req := model.Request{Method: st.Method, Headers: map[string]string{}, Protocol: st.Protocol()}
 	for k, v := range st.Headers {
 		s, err := substitute(v, vars, nil)
 		if err != nil {
@@ -289,7 +321,93 @@ func BuildRequest(st Step, vars map[string]any) (model.Request, error) {
 		}
 		req.Headers[k] = s
 	}
+	defer func() {
+		if len(req.Headers) == 0 {
+			req.Headers = nil
+		}
+	}()
+	switch req.Protocol {
+	case model.ProtoGRPC:
+		svc, m, err := grpcx.SplitMethod(st.GRPC)
+		if err != nil {
+			return req, err
+		}
+		req.Method, req.Path = "GRPC", "/"+svc+"/"+m
+		var msg any = st.Message
+		if len(st.Messages) > 0 {
+			msg, req.Stream = st.Messages, "client"
+		}
+		if msg != nil {
+			v, err := substituteValue(msg, vars)
+			if err != nil {
+				return req, err
+			}
+			b, err := json.Marshal(v)
+			if err != nil {
+				return req, err
+			}
+			req.Body = string(b)
+		}
+		return req, nil
+	case model.ProtoWebSocket:
+		p, q, err := buildPath(st.WebSocket, st.Query, vars)
+		if err != nil {
+			return req, err
+		}
+		req.Method, req.Path, req.Query = "GET", p, q
+		send := st.Send
+		if send == nil {
+			send = []any{}
+		}
+		v, err := substituteValue(send, vars)
+		if err != nil {
+			return req, err
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return req, err
+		}
+		req.Body, req.Receive, req.WaitMS = string(b), st.Receive, st.WaitMS
+		return req, nil
+	}
+	p, q, err := buildPath(st.Path, st.Query, vars)
+	if err != nil {
+		return req, err
+	}
+	req.Path, req.Query = p, q
 	switch {
+	case req.Protocol == model.ProtoGraphQL:
+		var variables any
+		if len(st.Variables) > 0 {
+			v, err := substituteValue(map[string]any(st.Variables), vars)
+			if err != nil {
+				return req, err
+			}
+			variables = v
+		}
+		query, err := substitute(st.GraphQL, vars, nil)
+		if err != nil {
+			return req, err
+		}
+		if req.Method == "GET" {
+			vals := url.Values{"query": {query}}
+			if variables != nil {
+				b, _ := json.Marshal(variables)
+				vals.Set("variables", string(b))
+			}
+			if st.OperationName != "" {
+				vals.Set("operationName", st.OperationName)
+			}
+			if req.Query != "" {
+				req.Query += "&"
+			}
+			req.Query += vals.Encode()
+			break
+		}
+		req.Body = gql.Envelope(query, variables, st.OperationName)
+		if !hasHeader(req.Headers, "Content-Type") {
+			req.Headers["Content-Type"] = "application/json"
+		}
 	case st.JSON != nil:
 		v, err := substituteValue(st.JSON, vars)
 		if err != nil {
@@ -313,10 +431,51 @@ func BuildRequest(st Step, vars map[string]any) (model.Request, error) {
 			req.Headers["Content-Type"] = "application/json"
 		}
 	}
-	if len(req.Headers) == 0 {
-		req.Headers = nil
-	}
 	return req, nil
+}
+
+// buildPath fills variables into a path (which may carry a query string) and
+// adds the query parameters.
+func buildPath(raw string, query map[string]any, vars map[string]any) (string, string, error) {
+	// A path that starts with a saved path (e.g. a Location header) uses it as is.
+	if m := varRe.FindStringSubmatchIndex(raw); m != nil && m[0] == 0 {
+		if v, ok := vars[raw[m[2]:m[3]]]; ok && strings.HasPrefix(scalar(v), "/") {
+			raw = scalar(v) + raw[m[1]:]
+		}
+	}
+	path, rawQuery, _ := strings.Cut(raw, "?")
+	p, err := substitute(path, vars, url.PathEscape)
+	if err != nil {
+		return "", "", err
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", "", fmt.Errorf("path %q does not start with / after filling in variables; requests can only go to the configured target", p)
+	}
+	q, err := substitute(rawQuery, vars, url.QueryEscape)
+	if err != nil {
+		return "", "", err
+	}
+	if len(query) > 0 {
+		vals := url.Values{}
+		for k, v := range query {
+			items, ok := v.([]any)
+			if !ok {
+				items = []any{v}
+			}
+			for _, item := range items {
+				s, err := substitute(scalar(item), vars, nil)
+				if err != nil {
+					return "", "", err
+				}
+				vals.Add(k, s)
+			}
+		}
+		if q != "" {
+			q += "&"
+		}
+		q += vals.Encode()
+	}
+	return p, q, nil
 }
 
 func hasHeader(h map[string]string, name string) bool {
@@ -363,10 +522,68 @@ func statusMatcher(spec any) (func(int) bool, error) {
 	}, nil
 }
 
+// codeMatcher turns NOT_FOUND, [OK, NOT_FOUND] or 5 into a check on a gRPC
+// code name.
+func codeMatcher(spec any) (func(string) bool, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	items, ok := spec.([]any)
+	if !ok {
+		items = []any{spec}
+	}
+	want := map[string]bool{}
+	for _, item := range items {
+		c, ok := grpcx.ParseCode(scalar(item))
+		if !ok {
+			return nil, fmt.Errorf("expect.code %v: use a gRPC code such as NOT_FOUND or INVALID_ARGUMENT (%s)", item, strings.Join(grpcx.CodeNames(), ", "))
+		}
+		want[grpcx.CodeName(c)] = true
+	}
+	return func(code string) bool { return want[code] }, nil
+}
+
+// closeMatcher turns 1008 or [1000, 1001] into a check on a close code.
+func closeMatcher(spec any) (func(int) bool, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	items, ok := spec.([]any)
+	if !ok {
+		items = []any{spec}
+	}
+	want := map[int]bool{}
+	for _, item := range items {
+		n, err := strconv.Atoi(scalar(item))
+		if err != nil || n < 1000 || n > 4999 {
+			return nil, fmt.Errorf("expect.close %v: use a WebSocket close code such as 1000, 1008 or 4401", item)
+		}
+		want[n] = true
+	}
+	return func(c int) bool { return want[c] }, nil
+}
+
 func assertResponse(e Expect, o model.Observed) []string {
 	var fails []string
 	if match, _ := statusMatcher(e.Status); match != nil && !match(o.Status) {
 		fails = append(fails, fmt.Sprintf("status %d, expected %s", o.Status, scalar(e.Status)))
+	}
+	if match, _ := codeMatcher(e.Code); match != nil && !match(o.Code) {
+		msg := ""
+		var body struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(o.Body), &body) == nil && body.Message != "" {
+			msg = fmt.Sprintf(" (%q)", body.Message)
+		}
+		fails = append(fails, fmt.Sprintf("code %s%s, expected %s", o.Code, msg, scalar(e.Code)))
+	}
+	if match, _ := closeMatcher(e.Close); match != nil && !match(o.Close) {
+		got := "the connection was not closed"
+		if o.Close != 0 {
+			got = fmt.Sprintf("closed with %d", o.Close)
+		}
+		fails = append(fails, fmt.Sprintf("%s, expected a close with %s", got, scalar(e.Close)))
 	}
 	if len(e.JSON) > 0 {
 		var body any
@@ -550,6 +767,8 @@ func extract(o model.Observed, src string) (any, bool) {
 	switch {
 	case src == "status":
 		return float64(o.Status), true
+	case src == "code":
+		return o.Code, o.Code != ""
 	case strings.HasPrefix(strings.ToLower(src), "header:"):
 		v := headerOf(o.Headers, strings.TrimSpace(src[len("header:"):]))
 		return v, v != ""
@@ -628,9 +847,12 @@ func WriteText(w io.Writer, results []Result, color bool) {
 			if s.Failed() {
 				mark = red + "FAIL" + reset
 			}
-			status := "no response"
-			if s.Status != 0 {
-				status = strconv.Itoa(s.Status)
+			status := s.Outcome
+			if status == "" {
+				status = "no response"
+				if s.Status != 0 {
+					status = strconv.Itoa(s.Status)
+				}
 			}
 			label := ""
 			if s.Name != "" {

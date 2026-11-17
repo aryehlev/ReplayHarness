@@ -14,7 +14,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aryehlev/ReplayHarness/internal/gql"
 	"github.com/aryehlev/ReplayHarness/internal/model"
+	"github.com/aryehlev/ReplayHarness/internal/wsx"
 )
 
 // Options tunes the checks.
@@ -70,6 +72,16 @@ func Evaluate(sc model.Scenario, ep *model.Endpoint, obs []model.Observed, base 
 	}
 	o := obs[0]
 	what := describe(sc)
+	proto := sc.Request.Protocol
+	if o.Unsent != "" {
+		return nil
+	}
+	o, failure := Effective(o, proto)
+	if failure != "" {
+		add("server-error", model.SevError, failure+" on "+what, snippet(o.Body))
+		leak(o, add)
+		return out
+	}
 
 	if o.Status == 0 {
 		if o.Timeout {
@@ -91,10 +103,10 @@ func Evaluate(sc model.Scenario, ep *model.Endpoint, obs []model.Observed, base 
 		}
 		add("regression", sev, fmt.Sprintf("recorded %d, now %d", sc.Recorded.Status, o.Status), snippet(o.Body))
 	case o.Status >= 500:
-		add("server-error", model.SevError, fmt.Sprintf("%d on %s", o.Status, what), snippet(o.Body))
+		add("server-error", model.SevError, fmt.Sprintf("%s on %s", o.StatusText(), what), snippet(o.Body))
 	default:
 		expectation(sc, o, what, add)
-		if ep != nil {
+		if ep != nil && ep.Protocol == "" {
 			documented(sc, ep, o, add)
 			contract(ep, o, add)
 		}
@@ -117,16 +129,73 @@ func Evaluate(sc model.Scenario, ep *model.Endpoint, obs []model.Observed, base 
 
 type addFunc func(check string, sev model.Severity, msg, detail string)
 
+// Effective rewrites a response so the HTTP checks apply to every
+// protocol. A GraphQL response whose errors look like a crash, or a WebSocket
+// the server closed with 1011, comes back with failure set and a 500 status.
+// GraphQL errors that reject the request count as a 400, and a WebSocket
+// closed for a policy or data reason as the 4xx it means. gRPC responses
+// already carry the HTTP equivalent of their code.
+func Effective(o model.Observed, proto string) (model.Observed, string) {
+	switch proto {
+	case model.ProtoGraphQL:
+		if o.Status == 0 {
+			return o, ""
+		}
+		msgs, internal, ok := gql.Errors(o.Body)
+		switch {
+		case !ok:
+		case len(internal) > 0:
+			o.Status = 500
+			return o, "GraphQL error that looks like a server failure: " + strings.Join(internal, "; ")
+		case len(msgs) > 0 && o.Status < 300:
+			o.Status, o.Code = 400, fmt.Sprintf("%d with GraphQL errors", o.Status)
+		}
+	case model.ProtoWebSocket:
+		if o.Status == 101 && o.Close == 1006 {
+			o.Status = 0
+			return o, ""
+		}
+		eff := wsx.Effective(o)
+		if eff >= 500 && o.Status == 101 {
+			o.Status = eff
+			return o, fmt.Sprintf("the server closed the WebSocket with %d (internal error)", o.Close)
+		}
+		if o.Status == 101 {
+			switch {
+			case o.Close != 0:
+				o.Code = fmt.Sprintf("101, closed %d", o.Close)
+			default:
+				o.Code = "101 (connection open)"
+			}
+		}
+		o.Status = eff
+	}
+	return o, ""
+}
+
 // Basic runs the checks that need no spec: no response, timeouts, 5xx
 // responses (unless allow5xx), leaked stack traces and slow responses.
-func Basic(o model.Observed, allow5xx bool, slow time.Duration) []model.Finding {
+// proto is the request's protocol ("" for HTTP).
+func Basic(o model.Observed, proto string, allow5xx bool, slow time.Duration) []model.Finding {
 	var out []model.Finding
 	add := func(check string, sev model.Severity, msg, detail string) {
 		out = append(out, model.Finding{Check: check, Severity: sev, Message: msg, Detail: detail})
 	}
+	if o.Unsent != "" {
+		return nil
+	}
+	o, failure := Effective(o, proto)
+	if failure != "" && !allow5xx {
+		add("server-error", model.SevError, failure, snippet(o.Body))
+		leak(o, add)
+		return out
+	}
 	switch {
 	case o.Status == 0 && o.Timeout:
 		add("timeout", model.SevError, "no response before the timeout", o.Error)
+		return out
+	case o.Status == 0 && proto == model.ProtoWebSocket && o.Close == 1006:
+		add("connection", model.SevError, "the server dropped the WebSocket without a close frame: it may have crashed", o.Error)
 		return out
 	case o.Status == 0:
 		add("connection", model.SevError, "no response: the server may have crashed or dropped the request", o.Error)
@@ -134,8 +203,8 @@ func Basic(o model.Observed, allow5xx bool, slow time.Duration) []model.Finding 
 	case o.Error != "":
 		add("connection", model.SevError, "connection dropped while the response body was being read", o.Error)
 	}
-	if o.Status >= 500 && !allow5xx {
-		add("server-error", model.SevError, fmt.Sprintf("returned %d", o.Status), snippet(o.Body))
+	if o.Status >= 500 && !allow5xx && failure == "" {
+		add("server-error", model.SevError, "returned "+o.StatusText(), snippet(o.Body))
 	}
 	leak(o, add)
 	if slow > 0 && o.DurationMS > float64(slow.Milliseconds()) {
@@ -161,7 +230,7 @@ func expectation(sc model.Scenario, o model.Observed, what string, add addFunc) 
 		case 404:
 			sev, hint = model.SevInfo, "the generated id or path probably does not exist; seed data or a recorded sample would get further"
 		}
-		add("rejected-valid", sev, fmt.Sprintf("%s got %d", what, o.Status), hint)
+		add("rejected-valid", sev, fmt.Sprintf("%s got %s", what, o.StatusText()), hint)
 	case model.ExpectReject:
 		if o.Status < 200 || o.Status >= 300 {
 			return
@@ -172,11 +241,15 @@ func expectation(sc model.Scenario, o model.Observed, what string, add addFunc) 
 		}
 		switch sc.Category {
 		case model.CatAuth:
-			add("auth-bypass", model.SevError, fmt.Sprintf("returned %d to a request without valid credentials, but the spec requires authentication", o.Status), "")
+			add("auth-bypass", model.SevError, fmt.Sprintf("returned %s to a request without valid credentials, but the endpoint requires authentication", o.StatusText()), "")
 		case model.CatMethod:
+			if sc.Request.Protocol == model.ProtoGraphQL {
+				add("get-mutation", model.SevError, fmt.Sprintf("a mutation sent with GET ran (returned %d without errors); GET must not run mutations, or a link can change data", o.Status), "")
+				break
+			}
 			add("undefined-method", sev, fmt.Sprintf("%s is not defined for this path but returned %d", sc.Request.Method, o.Status), "")
 		default:
-			add("accepted-invalid", sev, fmt.Sprintf("accepted %s with %d", what, o.Status), "")
+			add("accepted-invalid", sev, fmt.Sprintf("accepted %s with %s", what, o.StatusText()), "")
 		}
 	}
 }

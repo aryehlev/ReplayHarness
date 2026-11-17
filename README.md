@@ -1,7 +1,8 @@
 # ReplayHarness
 
 **Coding agents that find bugs in your API by sending it real requests.**
-ReplayHarness works with or without an OpenAPI spec. It uses two agents:
+REST, gRPC, GraphQL and WebSocket. ReplayHarness works with or without an
+OpenAPI spec, a `.proto` file or a GraphQL schema. It uses two agents:
 
 1. **A discovery agent** reads your code and maps the API: every route, its
    handler's `file:line`, its parameters and body, its auth, and the rules
@@ -10,8 +11,8 @@ ReplayHarness works with or without an OpenAPI spec. It uses two agents:
    which are multi-step requests that check what each handler should do,
    runs them against your local server, and reports the bugs it confirms.
 
-ReplayHarness gives both agents the tools: route discovery, a safe HTTP
-client fixed to your local server, a replay runner that carries values from
+ReplayHarness gives both agents the tools: route discovery, a safe client
+fixed to your local server (HTTP, gRPC, GraphQL and WebSocket), a replay runner that carries values from
 one request to the next, and hundreds of built-in probes. It works with
 Claude Code, Codex, Cursor, Gemini CLI and any agent that speaks
 [MCP](https://modelcontextprotocol.io).
@@ -127,6 +128,9 @@ an area: *"Check the orders endpoints with replayharness."*
 The [discovery agent](agents/replayharness-discovery.md) starts from what
 ReplayHarness finds on its own:
 * an OpenAPI or Swagger spec, if there is one
+* gRPC services in `.proto` files, or from the running server by reflection
+* GraphQL queries and mutations in a schema (`.graphql` files or `gql`
+  literals), or from the running server by introspection
 * routes found in the code by pattern, for Go, Express, Nest, Fastify,
   FastAPI, Flask, Django, Spring, axum, actix, Rails and Laravel
 
@@ -150,6 +154,20 @@ ReplayHarness validates the map and reports any route in the code that the
 map leaves out. If there is also a spec, the two are merged: the map adds
 handler locations, rules and auth to the spec's endpoints.
 
+Other protocols use the same map, with one key in place of `method` and
+`path`:
+
+```yaml
+  - grpc: orders.v1.Orders/CreateOrder      # the request message is the body
+    handler: server/orders.go:159
+    body: {required: [customer]}
+    rules: [customer is REQUIRED in orders.proto but never checked (orders.go:160)]
+  - graphql: mutation deleteProduct          # path defaults to /graphql
+    auth: true
+  - websocket: /ws/chat                      # body.example is one message
+    body: {example: {type: join, room: general}}
+```
+
 ### 2. Replays: `.replayharness/replays/*.yaml`
 
 The [replay agent](agents/replayharness-replay.md) first runs the built-in
@@ -172,6 +190,14 @@ replays:
 
 * **Steps:** `method`, `path`, `query`, `headers`, `json` or `body`,
   `no_auth`, `expect`, `save`.
+* **Other protocols:**
+  * gRPC: `grpc: pkg.Service/Method` with `message` (or `messages` for a
+    client stream), and `expect.code: NOT_FOUND`.
+  * GraphQL: `graphql: "query { ... }"` with `variables`, sent as POST to
+    `/graphql` unless the step gives `method` or `path`.
+  * WebSocket: `websocket: /path` with `send: [messages]` and `receive: N`.
+    The replies come back as a JSON array, and `expect.close` checks the
+    close code.
 * **`expect`:**
   * `status`: `404`, `[200, 201]` or `"4xx"`.
   * `json`: `$.path: value`, or a matcher such as `<integer>`, `<absent>` or
@@ -180,7 +206,10 @@ replays:
 * **`save`:** keeps a value from a response, such as an id or a `Location`
   header, for later steps.
 * **Built-in failures:** a 5xx, a dropped connection, a timeout or a leaked
-  stack trace fails a step even when no assertion mentions it.
+  stack trace fails a step even when no assertion mentions it. So do the
+  same failures in other protocols: gRPC `INTERNAL` or `UNKNOWN`, a GraphQL
+  error that looks like a crash, and a WebSocket closed with 1011 or dropped
+  without a close frame.
 
 The full format is in the [replay agent's instructions](agents/replayharness-replay.md#replay-format).
 
@@ -193,14 +222,58 @@ fixed bug fixed. It is optional, and also works in CI.
 | Tool | What the agent gets |
 |---|---|
 | `discover` | Endpoints with parameters, body, responses, auth, the handler's `file:line` and the rules from the map. Reads `.replayharness/api.yaml`, any OpenAPI/Swagger spec, routes in the code, the running server's spec or recorded traffic. Reports routes the map misses and errors in the map. |
-| `send_request` | One request and its full response, plus problems such as a 5xx or a leaked stack trace. |
-| `run_replays` | Runs replays, inline or from files. Each failing step comes back with the reason and a `curl` command. |
+| `send_request` | One request (HTTP, gRPC, GraphQL or WebSocket) and its full response, plus problems such as a 5xx or a leaked stack trace. |
+| `run_replays` | Runs replays, inline or from files. Each failing step comes back with the reason and a `curl`, `grpcurl` or `websocat` command. |
 | `probe` | Built-in requests for every endpoint: missing fields, wrong types, limits, malformed bodies, missing credentials. Findings come back grouped. See [docs/probes.md](docs/probes.md). |
+
+## gRPC, GraphQL and WebSocket
+
+The [`examples/protocols`](examples/protocols) demo serves all three, with
+planted bugs, an [API map](examples/protocols/api.yaml) and
+[replays](examples/protocols/replays.yaml):
+
+```sh
+go run ./examples/protocols/cmd/protocols-demo &    # HTTP on :8081, gRPC on :9091
+replayharness replay examples/protocols/replays.yaml --target http://127.0.0.1:8081 --grpc 127.0.0.1:9091
+```
+
+```text
+✗ an unknown order is NOT_FOUND
+    why: getOrder returns a plain error for a missing order, which gRPC sends as UNKNOWN (grpc.go:198)
+    1. gRPC orders.v1.Orders/GetOrder → UNKNOWN FAIL
+       - code UNKNOWN ("sql: no rows in result set (order 999999)"), expected NOT_FOUND
+       grpcurl -plaintext -d '{"id":999999}' 127.0.0.1:9091 orders.v1.Orders/GetOrder
+✗ the member count drops when a client leaves
+    why: the chat never removes a member whose connection ended (ws.go:32)
+    2. WS /ws/chat → 101 FAIL
+       - $[0].members is 2, expected 1
+       printf '%s\n' '{"name":"bob","room":"lobby-7371e6f9","type":"join"}' | websocat 'ws://127.0.0.1:8081/ws/chat'
+...
+5 passed, 12 failed
+```
+
+* **gRPC** needs no generated code. ReplayHarness reads the `.proto` files
+  in the repo (`--proto` adds more) or asks the server by reflection, and
+  sends messages as JSON. `--grpc host:port` sets the gRPC server when it is
+  not the HTTP one, and `--target grpc://host:port` tests a gRPC-only
+  server. Codes are checked like HTTP statuses: `INTERNAL`, `UNKNOWN` and
+  `DATA_LOSS` are server errors, and a REQUIRED field (`field_behavior`)
+  that is accepted when missing is a finding. Streams are supported: a
+  server stream's messages come back as a JSON array.
+* **GraphQL** probes send each query and mutation with missing, wrong-type
+  and extreme variables, and check the shape of the endpoint: malformed
+  bodies, unknown fields and a mutation sent with GET, which must not run.
+  A response is a failure when its errors look like a crash, such as
+  `internal system error` or a stack trace, even with status 200.
+* **WebSocket** probes send malformed, wrong-type and oversized messages,
+  and check that the server answers or closes cleanly instead of closing
+  with 1011 or dropping the connection.
 
 ## Without an agent
 
 ```sh
 replayharness run . --target http://localhost:8080          # built-in probes for every endpoint
+replayharness run . --target http://localhost:8080 --grpc localhost:9090   # and a gRPC server
 replayharness run . --target http://localhost:8080 --baseline http://localhost:9090   # compare two versions
 replayharness record --upstream http://localhost:8080 -o traffic.jsonl   # record real traffic through a proxy
 replayharness replay traffic.jsonl --target http://localhost:8080 --mutate   # replay it, and mutate it
@@ -225,8 +298,9 @@ the record, replay and baseline modes.
 
 ## Limits
 
-* Only REST over HTTP, with JSON or form bodies. GraphQL and gRPC are not
-  supported.
+* HTTP bodies must be JSON or forms. gRPC messages are written as JSON
+  (protobuf's JSON mapping). Bidirectional gRPC streams send all their
+  messages, then read the replies. GraphQL subscriptions are not probed.
 * Replays run one after another, so race conditions are not exercised yet.
 * Agents can be wrong. The replay agent checks each failure against the
   code, and every bug report comes with a `curl` command you can run
@@ -240,7 +314,10 @@ agents/               the discovery and replay agents
 skills/replayharness  the skill that runs them in order
 internal/mcp          the MCP server (JSON-RPC over stdio)
 internal/replay       the replay format and runner
-internal/discover     API maps, OpenAPI/Swagger, routes in code, traffic inference
+internal/discover     API maps, OpenAPI/Swagger, .proto, GraphQL schemas, routes in code, traffic
+internal/grpcx        the gRPC client: .proto compiling, reflection, dynamic messages
+internal/gql          GraphQL schemas, introspection and query building
+internal/wsx          the WebSocket client
 internal/agent        what discover shows an agent
 internal/generate     the built-in probes
 internal/runner       sending requests: target check, rate limit, timeout
@@ -248,10 +325,11 @@ internal/check        the checks that turn responses into findings
 internal/report       grouping, terminal output, JSON and JUnit
 internal/record       the recording proxy
 examples/buggyapi     the demo API with planted bugs, its map and its replays
+examples/protocols    the gRPC, GraphQL and WebSocket demo, its map and its replays
 ```
 
-`go test ./...` runs end-to-end tests against the demo API, with and
-without its spec.
+`go test ./...` runs end-to-end tests against both demos, with and without
+their specs and maps.
 
 ## License
 

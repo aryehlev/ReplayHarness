@@ -52,6 +52,23 @@ func ScanRepo(root string) (*model.API, error) {
 		}
 	}
 
+	routes := scanCode(root)
+
+	// gRPC methods from .proto files, GraphQL root fields from schema files.
+	grpcEps, notes := scanProtos(root)
+	api.Notes = append(api.Notes, notes...)
+	if len(grpcEps) > 0 {
+		api.Endpoints = append(api.Endpoints, grpcEps...)
+		api.Sources = append(api.Sources, fmt.Sprintf("%d gRPC methods in .proto files", len(grpcEps)))
+	}
+	if schema, notes, files := scanSDL(root); schema != nil || len(notes) > 0 {
+		api.Notes = append(api.Notes, notes...)
+		if schema.HasRoots() {
+			api.Endpoints = append(api.Endpoints, schema.Endpoints(graphqlPath(routes))...)
+			api.Sources = append(api.Sources, "GraphQL schema in "+strings.Join(files, ", "))
+		}
+	}
+
 	// The API map written by the discovery agent adds handlers and rules to
 	// the spec, or stands in for one.
 	var fromMap map[*model.Endpoint]bool
@@ -71,13 +88,17 @@ func ScanRepo(root string) (*model.API, error) {
 		fromMap = mergeMap(api, m)
 	}
 
-	routes := scanCode(root)
 	if specs == 0 && fromMap == nil {
+		added := 0
 		for _, r := range routes {
+			if servesProtocol(api, r) {
+				continue
+			}
 			api.Endpoints = append(api.Endpoints, routeEndpoint(r))
+			added++
 		}
-		if len(routes) > 0 {
-			api.Sources = append(api.Sources, fmt.Sprintf("%d routes in source code", len(routes)))
+		if added > 0 {
+			api.Sources = append(api.Sources, fmt.Sprintf("%d routes in source code", added))
 		}
 		return api, nil
 	}
@@ -592,10 +613,31 @@ func routeEndpoint(r route) *model.Endpoint {
 	return ep
 }
 
+// servesProtocol reports whether a route in the code is the mount point of a
+// GraphQL or WebSocket endpoint, not an HTTP endpoint of its own.
+func servesProtocol(api *model.API, r route) bool {
+	for _, ep := range api.Endpoints {
+		if (ep.Protocol == model.ProtoGraphQL || ep.Protocol == model.ProtoWebSocket) && pathsMatch(ep.Path, r.path) {
+			return true
+		}
+	}
+	return false
+}
+
 // computeDrift compares the spec's endpoints with the routes in the code.
+// Only HTTP endpoints take part: gRPC methods have no routes, and a GraphQL
+// or WebSocket endpoint shares one route.
 func computeDrift(api *model.API, routes []route) {
-	specEndpoints := append([]*model.Endpoint(nil), api.Endpoints...)
+	var specEndpoints []*model.Endpoint
+	for _, ep := range api.Endpoints {
+		if ep.Protocol == "" {
+			specEndpoints = append(specEndpoints, ep)
+		}
+	}
 	for _, r := range routes {
+		if servesProtocol(api, r) {
+			continue
+		}
 		matched := false
 		for _, ep := range specEndpoints {
 			if (r.method == "" || r.method == ep.Method) && pathsMatch(ep.Path, r.path) {

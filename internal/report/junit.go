@@ -78,7 +78,7 @@ func WriteJUnit(path string, r *Report, failOn string) error {
 					fmt.Fprintf(&text, "  %s\n", f.Detail)
 				}
 			}
-			fmt.Fprintf(&text, "\n%s\n", Curl(Options{Target: r.Target}, res.Scenario))
+			fmt.Fprintf(&text, "\n%s\n", Command(Options{Target: r.Target}, res.Scenario))
 			tc.Failure = &junitFailure{Message: clean(failing[0].Message), Type: failing[0].Check, Text: clean(text.String())}
 			s.Failures++
 			all.Failures++

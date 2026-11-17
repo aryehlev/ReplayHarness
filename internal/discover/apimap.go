@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aryehlev/ReplayHarness/internal/grpcx"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 )
 
@@ -46,14 +47,19 @@ type apiMap struct {
 }
 
 type mapEndpoint struct {
-	Method    string         `json:"method"`
-	Path      string         `json:"path"`
-	Handler   string         `json:"handler"`
-	Auth      bool           `json:"auth"`
-	Params    []mapParam     `json:"params"`
-	Body      *mapBody       `json:"body"`
-	Responses map[string]any `json:"responses"`
-	Rules     []string       `json:"rules"`
+	Method    string            `json:"method"`
+	Path      string            `json:"path"`
+	GRPC      string            `json:"grpc"`      // package.Service/Method
+	Stream    string            `json:"stream"`    // gRPC: client, server or bidi
+	GraphQL   string            `json:"graphql"`   // "query user" or "mutation createUser"
+	Args      map[string]string `json:"args"`      // GraphQL: argument -> type, e.g. {id: ID!}
+	WebSocket string            `json:"websocket"` // the path that upgrades
+	Handler   string            `json:"handler"`
+	Auth      bool              `json:"auth"`
+	Params    []mapParam        `json:"params"`
+	Body      *mapBody          `json:"body"`
+	Responses map[string]any    `json:"responses"`
+	Rules     []string          `json:"rules"`
 }
 
 type mapField struct {
@@ -97,34 +103,151 @@ func parseAPIMap(doc map[string]any, origin string) (*model.API, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
-		return nil, fmt.Errorf("%s: invalid API map: %w", origin, err)
+		hint := ""
+		if strings.Contains(err.Error(), "of type string") {
+			hint = ` (in YAML, quote a value that contains ": " or starts with { or [, e.g. - "join answers {type: joined}")`
+		}
+		return nil, fmt.Errorf("%s: invalid API map: %w%s", origin, err, hint)
 	}
 	api := &model.API{Title: m.Name, Sources: []string{origin}, AuthHeaders: m.AuthHeaders, Notes: m.Notes}
 	for i, me := range m.Endpoints {
 		ep, err := me.endpoint(origin)
 		if err != nil {
-			return nil, fmt.Errorf("%s: endpoint %d (%s %s): %w", origin, i+1, me.Method, me.Path, err)
+			return nil, fmt.Errorf("%s: endpoint %d (%s): %w", origin, i+1, me.label(), err)
 		}
 		if api.Endpoint(ep.Key()) != nil {
 			return nil, fmt.Errorf("%s: %s is listed twice", origin, ep.Key())
 		}
 		api.Endpoints = append(api.Endpoints, ep)
 	}
+	// A GraphQL entry without a path is served where the others say.
+	gqlPath := ""
+	for _, me := range m.Endpoints {
+		if me.GraphQL != "" && me.Path != "" {
+			gqlPath = me.Path
+			break
+		}
+	}
+	if gqlPath != "" {
+		for i, me := range m.Endpoints {
+			if me.GraphQL != "" && me.Path == "" {
+				api.Endpoints[i].Path = gqlPath
+			}
+		}
+	}
 	return api, nil
 }
 
 var mapMethods = map[string]bool{"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true, "HEAD": true, "OPTIONS": true}
 
+func (me mapEndpoint) label() string {
+	switch {
+	case me.GRPC != "":
+		return "grpc " + me.GRPC
+	case me.GraphQL != "":
+		return "graphql " + me.GraphQL
+	case me.WebSocket != "":
+		return "websocket " + me.WebSocket
+	}
+	return me.Method + " " + me.Path
+}
+
+// protocol checks that the entry names one kind of endpoint and fills in
+// what that kind needs.
+func (me mapEndpoint) protocol(ep *model.Endpoint) error {
+	kinds := 0
+	for _, set := range []bool{me.GRPC != "", me.GraphQL != "", me.WebSocket != "", me.Method != ""} {
+		if set {
+			kinds++
+		}
+	}
+	if kinds != 1 {
+		return fmt.Errorf("give exactly one of method (with path), grpc, graphql or websocket")
+	}
+	if me.GraphQL == "" && len(me.Args) > 0 {
+		return fmt.Errorf("args are for graphql entries; use params for HTTP")
+	}
+	if me.GRPC == "" && me.Stream != "" {
+		return fmt.Errorf("stream is for grpc entries")
+	}
+	switch {
+	case me.GRPC != "":
+		svc, m, err := grpcx.SplitMethod(me.GRPC)
+		if err != nil {
+			return err
+		}
+		if me.Path != "" || len(me.Params) > 0 {
+			return fmt.Errorf("a grpc entry takes the request message as body; leave out path and params")
+		}
+		switch me.Stream {
+		case "", "client", "server", "bidi":
+		default:
+			return fmt.Errorf("stream must be client, server or bidi")
+		}
+		ep.Protocol, ep.Method, ep.Path, ep.Stream = model.ProtoGRPC, "GRPC", "/"+svc+"/"+m, me.Stream
+	case me.GraphQL != "":
+		parts := strings.Fields(me.GraphQL)
+		op, field := "query", ""
+		switch len(parts) {
+		case 1:
+			field = parts[0]
+		case 2:
+			op, field = strings.ToLower(parts[0]), parts[1]
+		}
+		if field == "" || (op != "query" && op != "mutation" && op != "subscription") {
+			return fmt.Errorf(`graphql must be "query <field>", "mutation <field>" or "subscription <field>"`)
+		}
+		path := me.Path
+		if path == "" {
+			path = "/graphql"
+		}
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("path must start with /")
+		}
+		gop := &model.GraphQLOp{Operation: op, Field: field, ArgTypes: map[string]string{}}
+		for _, name := range sortedKeys(me.Args) {
+			gop.ArgTypes[name] = me.Args[name]
+			gop.ArgOrder = append(gop.ArgOrder, name)
+		}
+		ep.Protocol, ep.Method, ep.Path, ep.GraphQL = model.ProtoGraphQL, strings.ToUpper(op), path, gop
+	case me.WebSocket != "":
+		if !strings.HasPrefix(me.WebSocket, "/") {
+			return fmt.Errorf("websocket must be a path starting with /")
+		}
+		if me.Path != "" {
+			return fmt.Errorf("a websocket entry has its path in websocket; leave out path")
+		}
+		path, _ := normalizePath(me.WebSocket)
+		ep.Protocol, ep.Method, ep.Path = model.ProtoWebSocket, "WS", path
+	default:
+		method := strings.ToUpper(strings.TrimSpace(me.Method))
+		if !mapMethods[method] {
+			return fmt.Errorf("method must be one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+		}
+		if !strings.HasPrefix(me.Path, "/") {
+			return fmt.Errorf("path must start with /")
+		}
+		path, _ := normalizePath(me.Path)
+		ep.Method, ep.Path = method, path
+	}
+	return nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (me mapEndpoint) endpoint(origin string) (*model.Endpoint, error) {
-	method := strings.ToUpper(strings.TrimSpace(me.Method))
-	if !mapMethods[method] {
-		return nil, fmt.Errorf("method must be one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+	ep := &model.Endpoint{Secured: me.Auth, Source: origin, Code: me.Handler, Rules: me.Rules}
+	if err := me.protocol(ep); err != nil {
+		return nil, err
 	}
-	if !strings.HasPrefix(me.Path, "/") {
-		return nil, fmt.Errorf("path must start with /")
-	}
-	path, _ := normalizePath(me.Path)
-	ep := &model.Endpoint{Method: method, Path: path, Secured: me.Auth, Source: origin, Code: me.Handler, Rules: me.Rules}
+	path := ep.Path
 
 	seen := map[string]bool{}
 	for _, p := range me.Params {
@@ -150,6 +273,9 @@ func (me mapEndpoint) endpoint(origin string) (*model.Endpoint, error) {
 		seen[p.In+" "+p.Name] = true
 	}
 	for _, name := range PathParamNames(path) {
+		if ep.Protocol == model.ProtoGRPC || ep.Protocol == model.ProtoGraphQL {
+			break
+		}
 		if !seen["path "+name] {
 			ep.Params = append(ep.Params, model.Param{Name: name, In: "path", Required: true})
 		}
@@ -194,6 +320,29 @@ func (me mapEndpoint) endpoint(origin string) (*model.Endpoint, error) {
 		ep.Body = s
 	}
 
+	if gop := ep.GraphQL; gop != nil {
+		if ep.Body == nil {
+			ep.Body = &model.Schema{Type: "object", Properties: map[string]*model.Schema{}}
+		}
+		ep.BodyType, ep.BodyRequired = "application/json", true
+		for _, name := range gop.ArgOrder {
+			t := gop.ArgTypes[name]
+			if ep.Body.Properties[name] == nil {
+				ep.Body.Properties[name] = graphqlArgSchema(t)
+			}
+			if strings.HasSuffix(t, "!") && !ep.Body.IsRequired(name) {
+				ep.Body.Required = append(ep.Body.Required, name)
+			}
+		}
+		// Arguments that only the example shows get a type from their value.
+		for _, name := range ep.Body.PropertyNames() {
+			if _, ok := gop.ArgTypes[name]; !ok {
+				gop.ArgTypes[name] = graphqlTypeOf(ep.Body.Properties[name], ep.Body.IsRequired(name))
+				gop.ArgOrder = append(gop.ArgOrder, name)
+			}
+		}
+	}
+
 	if len(me.Responses) > 0 {
 		ep.Responses = map[string]*model.ResponseSpec{}
 		for code, v := range me.Responses {
@@ -202,6 +351,47 @@ func (me mapEndpoint) endpoint(origin string) (*model.Endpoint, error) {
 		}
 	}
 	return ep, nil
+}
+
+func graphqlArgSchema(t string) *model.Schema {
+	nonNull := strings.HasSuffix(t, "!")
+	base := strings.TrimSuffix(t, "!")
+	if strings.HasPrefix(base, "[") {
+		inner := strings.TrimSuffix(strings.TrimPrefix(base, "["), "]")
+		return &model.Schema{Type: "array", Items: graphqlArgSchema(inner), Nullable: !nonNull, TypeName: t}
+	}
+	s := &model.Schema{Nullable: !nonNull, TypeName: base}
+	switch base {
+	case "Int":
+		s.Type = "integer"
+	case "Float":
+		s.Type = "number"
+	case "Boolean":
+		s.Type = "boolean"
+	case "String", "ID":
+		s.Type = "string"
+	default:
+		s.Type = "object" // an input type or a custom scalar; the example shows which
+	}
+	return s
+}
+
+func graphqlTypeOf(s *model.Schema, required bool) string {
+	t := "String"
+	switch s.Type {
+	case "integer":
+		t = "Int"
+	case "number":
+		t = "Float"
+	case "boolean":
+		t = "Boolean"
+	case "array":
+		t = "[" + graphqlTypeOf(s.Items, false) + "]"
+	}
+	if required {
+		t += "!"
+	}
+	return t
 }
 
 func (f mapField) schema() *model.Schema {
@@ -314,7 +504,7 @@ func mergeMap(api, m *model.API) map[*model.Endpoint]bool {
 	for _, me := range m.Endpoints {
 		var match *model.Endpoint
 		for _, ep := range api.Endpoints {
-			if ep.Method == me.Method && pathsMatch(ep.Path, me.Path) {
+			if sameEndpoint(ep, me) {
 				match = ep
 				break
 			}
@@ -331,6 +521,14 @@ func mergeMap(api, m *model.API) map[*model.Endpoint]bool {
 		match.Secured = match.Secured || me.Secured
 		if match.Body == nil && me.Body != nil {
 			match.Body, match.BodyType, match.BodyRequired = me.Body, me.BodyType, me.BodyRequired
+		} else if match.Body != nil && me.Body != nil {
+			overlay(match.Body, me.Body)
+		}
+		if match.Protocol == model.ProtoGraphQL && me.Path != "/graphql" {
+			match.Path = me.Path
+		}
+		if match.Stream == "" {
+			match.Stream = me.Stream
 		}
 		if len(match.Params) == 0 {
 			match.Params = me.Params
@@ -341,4 +539,62 @@ func mergeMap(api, m *model.API) map[*model.Endpoint]bool {
 	}
 	api.Notes = append(api.Notes, m.Notes...)
 	return fromMap
+}
+
+func sameEndpoint(ep, me *model.Endpoint) bool {
+	if ep.Protocol != me.Protocol {
+		return false
+	}
+	switch ep.Protocol {
+	case model.ProtoGRPC:
+		return ep.Path == me.Path
+	case model.ProtoGraphQL:
+		return ep.Method == me.Method && ep.GraphQL != nil && me.GraphQL != nil && ep.GraphQL.Field == me.GraphQL.Field
+	}
+	return ep.Method == me.Method && pathsMatch(ep.Path, me.Path)
+}
+
+// overlay adds what the map says about fields (required, limits, formats,
+// examples) to a schema that came from a spec, .proto file or GraphQL schema.
+func overlay(dst, src *model.Schema) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.Example != nil {
+		dst.Example = src.Example
+	}
+	for _, r := range src.Required {
+		if !dst.IsRequired(r) {
+			dst.Required = append(dst.Required, r)
+		}
+	}
+	if src.Minimum != nil {
+		dst.Minimum = src.Minimum
+	}
+	if src.Maximum != nil {
+		dst.Maximum = src.Maximum
+	}
+	if src.MinLength != nil {
+		dst.MinLength = src.MinLength
+	}
+	if src.MaxLength != nil {
+		dst.MaxLength = src.MaxLength
+	}
+	if src.Pattern != "" {
+		dst.Pattern = src.Pattern
+	}
+	if src.Format != "" && dst.Type == "string" {
+		dst.Format = src.Format
+	}
+	if len(src.Enum) > 0 && len(dst.Enum) == 0 {
+		dst.Enum = src.Enum
+	}
+	for name, sp := range src.Properties {
+		if dp, ok := dst.Properties[name]; ok {
+			overlay(dp, sp)
+		}
+	}
+	if dst.Items != nil {
+		overlay(dst.Items, src.Items)
+	}
 }

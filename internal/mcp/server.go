@@ -44,12 +44,12 @@ type Server struct {
 }
 
 // Instructions are sent to the agent when it connects.
-const Instructions = `ReplayHarness finds bugs in the HTTP service in this project by sending real requests to a running local server.
+const Instructions = `ReplayHarness finds bugs in the service in this project by sending real requests to a running local server: HTTP/REST, gRPC, GraphQL and WebSocket.
 It works in two steps:
-1. Discovery: read the code and write .replayharness/api.yaml, the API map: every route with its handler file:line, parameters, an example body, required fields, auth and the rules the handler enforces. No OpenAPI spec is needed. discover shows what is known so far and validates the map.
+1. Discovery: read the code and write .replayharness/api.yaml, the API map: every route, gRPC method, GraphQL field and WebSocket with its handler file:line, parameters, an example body or message, required fields, auth and the rules the handler enforces. No OpenAPI spec is needed; .proto files, GraphQL schemas, gRPC reflection and GraphQL introspection are read when present. discover shows what is known so far and validates the map.
 2. Replays: read the map and the handlers, write replays (multi-step requests with expectations) to .replayharness/replays/*.yaml, run them with run_replays, and check each failure against the code before reporting it. probe gives a quick baseline of built-in requests first.
 In Claude Code, the replayharness-discovery and replayharness-replay agents do these steps.
-Requests only go to the target set when ReplayHarness started; paths start with /. Requests may create, change and delete data. Do not try to reach other hosts.`
+Requests only go to the targets set when ReplayHarness started (the HTTP server and, for gRPC, its gRPC address); paths start with /. Requests may create, change and delete data. Do not try to reach other hosts.`
 
 var protocolVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
 
@@ -178,25 +178,37 @@ func tools() []any {
 	return []any{
 		map[string]any{
 			"name": "discover",
-			"description": "List the service's endpoints: method, path, parameters, body schema, responses, whether auth is required, the file:line of each handler " +
-				"and the rules from the API map. Reads .replayharness/api.yaml (the API map) and any OpenAPI spec, and finds routes in the code by pattern. " +
+			"description": "List the service's endpoints: HTTP routes, gRPC methods, GraphQL fields and WebSockets, with parameters, body or message schema, responses, " +
+				"whether auth is required, the file:line of each handler and the rules from the API map. Reads .replayharness/api.yaml (the API map), any OpenAPI spec, " +
+				".proto files and GraphQL schemas, finds routes in the code by pattern, and asks the running server (gRPC reflection, GraphQL introspection) when the code does not say. " +
 				"Reports routes in the code that the map or spec leave out, and errors in the map. Call it again after editing the map to validate it.",
 			"inputSchema": obj(map[string]any{
-				"source": str("A source tree, an API map, an OpenAPI/Swagger file, or recorded traffic (.jsonl/.har). Defaults to the project ReplayHarness was started for; \"target\" fetches the spec from the running server."),
+				"source": str("A source tree, an API map, an OpenAPI/Swagger file, or recorded traffic (.jsonl/.har). Defaults to the project ReplayHarness was started for; \"target\" asks the running server (OpenAPI document, GraphQL introspection, gRPC reflection)."),
 			}),
 		},
 		map[string]any{
-			"name":        "send_request",
-			"description": "Send one request to the target server and see the full response. Use it to explore before writing replays.",
+			"name": "send_request",
+			"description": "Send one request to the target server and see the full response. Use it to explore before writing replays. " +
+				"HTTP: method and path. gRPC: grpc (package.Service/Method) and message. GraphQL: graphql (the query) and variables. WebSocket: websocket (the path), send and receive.",
 			"inputSchema": obj(map[string]any{
-				"method":  str("HTTP method, e.g. GET"),
-				"path":    str("Path starting with /, may include a query string"),
-				"query":   map[string]any{"type": "object", "description": "Query parameters", "additionalProperties": true},
-				"headers": map[string]any{"type": "object", "description": "Extra headers", "additionalProperties": map[string]any{"type": "string"}},
-				"json":    map[string]any{"description": "Body, sent as JSON"},
-				"body":    str("Raw body, sent as is (use with a Content-Type header)"),
-				"no_auth": map[string]any{"type": "boolean", "description": "Leave out the credentials the server was started with"},
-			}, "method", "path"),
+				"method":         str("HTTP method, e.g. GET"),
+				"path":           str("Path starting with /, may include a query string (for GraphQL, defaults to /graphql)"),
+				"query":          map[string]any{"type": "object", "description": "Query parameters", "additionalProperties": true},
+				"headers":        map[string]any{"type": "object", "description": "Extra headers (gRPC metadata for gRPC)", "additionalProperties": map[string]any{"type": "string"}},
+				"json":           map[string]any{"description": "Body, sent as JSON"},
+				"body":           str("Raw body, sent as is (use with a Content-Type header)"),
+				"no_auth":        map[string]any{"type": "boolean", "description": "Leave out the credentials the server was started with"},
+				"grpc":           str("gRPC method, e.g. users.v1.Users/GetUser"),
+				"message":        map[string]any{"description": "gRPC request message as JSON, with field names as in the .proto"},
+				"messages":       map[string]any{"type": "array", "description": "gRPC messages for a client or bidi streaming method"},
+				"graphql":        str("GraphQL query or mutation, e.g. query ($id: ID!) { user(id: $id) { id name } }"),
+				"variables":      map[string]any{"type": "object", "description": "GraphQL variables", "additionalProperties": true},
+				"operation_name": str("GraphQL operationName"),
+				"websocket":      str("WebSocket path to upgrade, e.g. /ws/chat"),
+				"send":           map[string]any{"type": "array", "description": "WebSocket messages to send; strings go as they are, anything else as JSON"},
+				"receive":        map[string]any{"type": "integer", "description": "WebSocket: wait for this many messages"},
+				"wait_ms":        map[string]any{"type": "integer", "description": "WebSocket: how long to wait for messages (default 1000)"},
+			}),
 		},
 		map[string]any{
 			"name":        "run_replays",
@@ -233,7 +245,7 @@ func (s *Server) call(ctx context.Context, name string, args json.RawMessage) (s
 		if err != nil {
 			return "", err
 		}
-		text := agent.Context(api, s.client.Target())
+		text := agent.Context(api, s.client.Target(), s.client.GRPCAddr())
 		src := a.Source
 		if src == "" {
 			src = s.Source
@@ -278,6 +290,17 @@ func (s *Server) discover(ctx context.Context, source string) (*model.API, error
 			}
 		}
 	}
+	if source == "" || source == "target" {
+		if err != nil {
+			api, err = &model.API{Title: "API"}, nil
+		}
+		s.fromServer(ctx, api, true)
+		if len(api.Endpoints) == 0 {
+			return nil, fmt.Errorf("the server at %s offers no OpenAPI document, GraphQL introspection or gRPC reflection; point discover at the source tree instead", s.client.Target())
+		}
+	} else if err == nil {
+		s.fromServer(ctx, api, false)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +308,66 @@ func (s *Server) discover(ctx context.Context, source string) (*model.API, error
 	s.api = api
 	s.mu.Unlock()
 	return api, nil
+}
+
+// fromServer adds what the running server can say about itself: its gRPC
+// services through reflection, when a gRPC target was given and the code did
+// not define them, and its GraphQL schema through introspection, when the
+// code has a GraphQL route but no schema file. always asks even without such
+// hints.
+func (s *Server) fromServer(ctx context.Context, api *model.API, always bool) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if !discover.HasProtocol(api, model.ProtoGRPC) && (s.Config.GRPCTarget != "" || always) {
+		if g, err := s.client.GRPC(); err == nil {
+			root := s.Source
+			if g2, err := discover.GRPCFromServer(ctx, g, root); err == nil {
+				discover.AddEndpoints(api, g2)
+			} else if s.Config.GRPCTarget != "" {
+				api.Notes = append(api.Notes, err.Error())
+			}
+		}
+	}
+	if discover.HasProtocol(api, model.ProtoGraphQL) {
+		return
+	}
+	var paths []string
+	var mounts []*model.Endpoint
+	for _, ep := range api.Endpoints {
+		lower := strings.ToLower(ep.Path)
+		if ep.Protocol == "" && (strings.Contains(lower, "graphql") || lower == "/query") {
+			paths = append(paths, ep.Path)
+			mounts = append(mounts, ep)
+		}
+	}
+	if len(paths) == 0 && always {
+		paths = discover.GraphQLPaths
+	}
+	if len(paths) == 0 {
+		return
+	}
+	hc := &http.Client{Timeout: 15 * time.Second}
+	g, err := discover.GraphQLFromServer(ctx, hc, s.client.Target(), paths, s.Config.Headers)
+	if err != nil {
+		if !always {
+			api.Notes = append(api.Notes, "GraphQL introspection failed: "+err.Error())
+		}
+		return
+	}
+	if discover.AddEndpoints(api, g) > 0 {
+		// The route that serves GraphQL is not an HTTP endpoint of its own.
+		keep := api.Endpoints[:0]
+		for _, ep := range api.Endpoints {
+			drop := false
+			for _, m := range mounts {
+				drop = drop || ep == m
+			}
+			if !drop {
+				keep = append(keep, ep)
+			}
+		}
+		api.Endpoints = keep
+	}
 }
 
 func (s *Server) sendRequest(ctx context.Context, args json.RawMessage) (string, error) {
@@ -305,11 +388,21 @@ func (s *Server) sendRequest(ctx context.Context, args json.RawMessage) (string,
 		return "", err
 	}
 	obs := s.client.Do(ctx, req, step.NoAuth)
+	if obs.Unsent != "" {
+		return "", fmt.Errorf("not sent: %s", obs.Unsent)
+	}
 	var b strings.Builder
 	if obs.Status == 0 {
 		fmt.Fprintf(&b, "No response after %.0fms: %s\n", obs.DurationMS, obs.Error)
 	} else {
-		fmt.Fprintf(&b, "HTTP %d (%.0fms)\n", obs.Status, obs.DurationMS)
+		switch req.Protocol {
+		case model.ProtoGRPC:
+			fmt.Fprintf(&b, "gRPC %s (%.0fms)\n", obs.Code, obs.DurationMS)
+		case model.ProtoWebSocket:
+			fmt.Fprintf(&b, "WebSocket %s (%.0fms)\n", obs.StatusText(), obs.DurationMS)
+		default:
+			fmt.Fprintf(&b, "HTTP %d (%.0fms)\n", obs.Status, obs.DurationMS)
+		}
 		names := make([]string, 0, len(obs.Headers))
 		for k := range obs.Headers {
 			names = append(names, k)
@@ -324,7 +417,7 @@ func (s *Server) sendRequest(ctx context.Context, args json.RawMessage) (string,
 		}
 		fmt.Fprintf(&b, "\n%s\n", body)
 	}
-	if fs := check.Basic(obs, false, s.Slow); len(fs) > 0 {
+	if fs := check.Basic(obs, req.Protocol, false, s.Slow); len(fs) > 0 {
 		b.WriteString("\nProblems:\n")
 		for _, f := range fs {
 			fmt.Fprintf(&b, "- %s %s: %s\n", f.Severity, f.Check, f.Message)

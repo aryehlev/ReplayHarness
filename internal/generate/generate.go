@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/aryehlev/ReplayHarness/internal/discover"
+	"github.com/aryehlev/ReplayHarness/internal/gql"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 )
 
@@ -56,6 +57,9 @@ func Suite(api *model.API, opts Options) *model.Suite {
 	methods := map[string]map[string]bool{}
 	anyMethod := map[string]bool{}
 	for _, ep := range api.Endpoints {
+		if ep.Protocol != "" {
+			continue
+		}
 		if methods[ep.Path] == nil {
 			methods[ep.Path] = map[string]bool{}
 		}
@@ -68,8 +72,10 @@ func Suite(api *model.API, opts Options) *model.Suite {
 	suite := &model.Suite{API: api}
 	for _, ep := range api.Endpoints {
 		g := &gen{ep: ep, opts: opts, seen: map[string]bool{}, pathMethods: methods[ep.Path]}
-		g.probeMethods = !probed[ep.Path] && !anyMethod[ep.Path]
-		probed[ep.Path] = true
+		if ep.Protocol == "" {
+			g.probeMethods = !probed[ep.Path] && !anyMethod[ep.Path]
+			probed[ep.Path] = true
+		}
 		suite.Scenarios = append(suite.Scenarios, g.generate()...)
 	}
 	return suite
@@ -149,15 +155,37 @@ type variant struct {
 
 func (g *gen) generate() []model.Scenario {
 	g.buildBaseline()
-	g.happy()
-	g.auth()
-	g.bodyFields()
-	g.bodyShape()
-	g.pathParams()
-	g.queryParams()
-	g.headerProbes()
-	g.wrongMethods()
-	g.consistency()
+	switch g.ep.Protocol {
+	case model.ProtoGRPC:
+		g.happy()
+		g.auth()
+		g.bodyFields()
+		g.grpcShape()
+	case model.ProtoGraphQL:
+		if g.ep.GraphQL == nil || g.ep.GraphQL.Operation == "subscription" {
+			return nil // subscriptions run over a WebSocket protocol of their own
+		}
+		g.happy()
+		g.auth()
+		g.bodyFields()
+		g.graphqlShape()
+	case model.ProtoWebSocket:
+		g.happy()
+		g.auth()
+		g.bodyFields()
+		g.pathParams()
+		g.wsShape()
+	default:
+		g.happy()
+		g.auth()
+		g.bodyFields()
+		g.bodyShape()
+		g.pathParams()
+		g.queryParams()
+		g.headerProbes()
+		g.wrongMethods()
+		g.consistency()
+	}
 	return capScenarios(g.out, g.opts.MaxPerEndpoint)
 }
 
@@ -265,7 +293,13 @@ func (g *gen) add(v variant) {
 	if !g.opts.Enabled(v.category) {
 		return
 	}
-	req := model.Request{Method: g.ep.Method, Headers: map[string]string{}}
+	req := model.Request{Protocol: g.ep.Protocol, Method: g.ep.Method, Headers: map[string]string{}}
+	switch g.ep.Protocol {
+	case model.ProtoGraphQL:
+		req.Method = "POST"
+	case model.ProtoWebSocket:
+		req.Method, req.WaitMS = "GET", 500
+	}
 	if v.method != "" {
 		req.Method = v.method
 	}
@@ -288,7 +322,30 @@ func (g *gen) add(v variant) {
 	for k, val := range g.base.headers {
 		req.Headers[k] = val
 	}
-	if !v.noBody && (g.base.hasBody || v.setBody || v.rawBody != nil) {
+	switch {
+	case g.ep.Protocol == model.ProtoGRPC:
+		// The message is JSON here and protobuf on the wire; there are no
+		// Content-Type or body-shape variants.
+		body := g.base.body
+		if v.setBody {
+			body = v.body
+		}
+		req.Body = g.encode(body)
+	case g.ep.Protocol == model.ProtoWebSocket:
+		var msgs []any
+		switch {
+		case v.rawBody != nil:
+			msgs = []any{*v.rawBody}
+		case v.setBody:
+			msgs = []any{v.body}
+		case g.base.hasBody && g.base.body != nil:
+			msgs = []any{g.base.body}
+		}
+		if msgs == nil {
+			msgs = []any{}
+		}
+		req.Body = g.encode(msgs)
+	case !v.noBody && (g.base.hasBody || v.setBody || v.rawBody != nil):
 		switch {
 		case v.rawBody != nil:
 			req.Body = *v.rawBody
@@ -298,6 +355,11 @@ func (g *gen) add(v variant) {
 			req.Body = g.base.rawBody
 		default:
 			req.Body = g.encode(g.base.body)
+		}
+		if g.ep.Protocol == model.ProtoGraphQL && v.rawBody == nil {
+			var vars any
+			_ = json.Unmarshal([]byte(req.Body), &vars)
+			req.Body = gql.Envelope(gql.Query(g.ep.GraphQL), vars, "")
 		}
 		req.Headers["Content-Type"] = g.bodyType()
 	}
@@ -310,6 +372,11 @@ func (g *gen) add(v variant) {
 	}
 	if len(req.Headers) == 0 {
 		req.Headers = nil
+	}
+	if g.ep.Protocol == model.ProtoWebSocket && v.expect == model.ExpectReject && v.category != model.CatAuth {
+		// A WebSocket server answers a bad message with a message of its own;
+		// only a crash or an error close is a finding.
+		v.expect, v.strict = model.ExpectNoCrash, false
 	}
 	sc := model.Scenario{
 		Endpoint: g.ep.Key(), Category: v.category, Name: v.name, Request: req,
@@ -432,7 +499,7 @@ func (g *gen) fieldProbes(s *model.Schema, path []any, required bool) {
 	if s == nil {
 		return
 	}
-	label := "body." + pathString(path)
+	label := g.fieldLabel() + pathString(path)
 	if required {
 		if g.ep.Inferred {
 			g.mutate(probe{model.CatMissing, label + " omitted (present in every sample)", nil, model.ExpectNoCrash, false}, path, true)
@@ -457,8 +524,16 @@ func (g *gen) fieldProbes(s *model.Schema, path []any, required bool) {
 			g.mutate(probe{model.CatNull, label + " = null", nil, model.ExpectNoCrash, false}, path, false)
 		}
 	}
-	for _, w := range wrongTypes(s) {
-		g.mutate(probe{model.CatWrongType, fmt.Sprintf("%s = %s (%s, expected %s)", label, show(w.value), w.name, typeName(s)), w.value, model.ExpectReject, false}, path, false)
+	if g.ep.Protocol == model.ProtoGRPC {
+		// A wrong type cannot be encoded as protobuf. An enum number the
+		// .proto does not define can.
+		if len(s.Enum) > 0 {
+			g.mutate(probe{model.CatBoundary, label + " = 999 (an enum number the .proto does not define)", json.Number("999"), model.ExpectNoCrash, false}, path, false)
+		}
+	} else {
+		for _, w := range wrongTypes(s) {
+			g.mutate(probe{model.CatWrongType, fmt.Sprintf("%s = %s (%s, expected %s)", label, show(w.value), w.name, typeName(s)), w.value, model.ExpectReject, false}, path, false)
+		}
 	}
 	for _, p := range boundaryProbes(s, label, nameOf(path), g.strictFor(true)) {
 		g.mutate(p, path, false)
@@ -466,6 +541,18 @@ func (g *gen) fieldProbes(s *model.Schema, path []any, required bool) {
 	for _, p := range extremeProbes(s, label, g.opts) {
 		g.mutate(p, path, false)
 	}
+}
+
+func (g *gen) fieldLabel() string {
+	switch g.ep.Protocol {
+	case model.ProtoGRPC:
+		return "message."
+	case model.ProtoGraphQL:
+		return "$"
+	case model.ProtoWebSocket:
+		return "message."
+	}
+	return "body."
 }
 
 func nameOf(path []any) string {

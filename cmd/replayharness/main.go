@@ -49,10 +49,11 @@ func init() {
 	}
 }
 
-const usageText = `ReplayHarness finds bugs in HTTP APIs with coding agents. A discovery agent maps
-the API from the code, with or without an OpenAPI spec. A replay agent writes
-multi-step requests that check what each handler should do, and ReplayHarness
-runs them against your local server.
+const usageText = `ReplayHarness finds bugs in APIs with coding agents: REST, gRPC, GraphQL and
+WebSocket. A discovery agent maps the API from the code, with or without an
+OpenAPI spec, .proto file or GraphQL schema. A replay agent writes multi-step
+requests that check what each handler should do, and ReplayHarness runs them
+against your local server.
 
 With a coding agent:
   replayharness mcp --target URL [--source .]        serve the tools to the agents (MCP over stdio)
@@ -74,6 +75,10 @@ Without an agent:
                                                      replay recorded traffic and compare
   replayharness version
 
+gRPC: --grpc host:port when the gRPC server is not the --target, or
+--target grpc://host:port for a gRPC-only server. --proto adds .proto files or
+directories; without them the server is asked by reflection.
+
 Requests only go to localhost and private addresses unless you pass
 --allow-remote. Use a server you own, ideally a disposable one: requests
 create, change and delete data.
@@ -82,6 +87,7 @@ Examples:
   claude mcp add replayharness -- replayharness mcp --target http://localhost:8080
   replayharness skill --install
   replayharness replay .replayharness/replays --target http://localhost:8080
+  replayharness run . --target http://localhost:8080 --grpc localhost:9090
 
 Run "replayharness <command> -h" for the flags of a command.
 `
@@ -194,6 +200,8 @@ func set(csv string) map[string]bool {
 
 type runFlags struct {
 	target, baseline string
+	grpc             string
+	protos           string
 	headers          headerFlags
 	authHeaders      string
 	concurrency      int
@@ -208,11 +216,28 @@ type runFlags struct {
 	verbose          bool
 	exact            bool
 	ignore           string
+	source           string // what the scenarios came from, for the default --proto
+}
+
+// grpcRepro is the gRPC address shown in grpcurl commands.
+func grpcRepro(target, grpc string) string {
+	if grpc != "" {
+		return grpc
+	}
+	if _, g := runner.SplitTarget(target); g != "" {
+		return g
+	}
+	if u, err := url.Parse(target); err == nil {
+		return u.Host
+	}
+	return ""
 }
 
 func (f *runFlags) register(fs *flag.FlagSet) {
 	f.headers = headerFlags{}
-	fs.StringVar(&f.target, "target", "", "base URL of the server to test, e.g. http://localhost:8080")
+	fs.StringVar(&f.target, "target", "", "base URL of the server to test, e.g. http://localhost:8080, or grpc://localhost:9090 for a gRPC-only server")
+	fs.StringVar(&f.grpc, "grpc", "", "host:port of the gRPC server, when it is not the --target (grpcs://host:port for TLS)")
+	fs.StringVar(&f.protos, "proto", "", "comma-separated .proto files or directories with the gRPC message types (default: the source tree; not needed when the server has reflection)")
 	fs.StringVar(&f.baseline, "baseline", "", "base URL of a second server (e.g. the previous version) to compare every response with")
 	fs.Var(f.headers, "H", "header sent with every request, e.g. -H 'Authorization: Bearer xyz' (repeatable)")
 	fs.StringVar(&f.authHeaders, "auth-header", "", "comma-separated extra header names that carry credentials")
@@ -232,6 +257,27 @@ func (f *runFlags) register(fs *flag.FlagSet) {
 func (f *runFlags) registerReplay(fs *flag.FlagSet) {
 	fs.BoolVar(&f.exact, "exact", false, "compare JSON values with the recording, not only their shape")
 	fs.StringVar(&f.ignore, "ignore", strings.Join(check.DefaultIgnore, ","), "with --exact: comma-separated JSON keys whose values may change")
+}
+
+// protoPaths returns the --proto paths, or the source when it is a directory.
+func (f *runFlags) protoPaths(source string) []string {
+	if f.protos != "" {
+		return splitOrdered(f.protos)
+	}
+	if info, err := os.Stat(source); err == nil && info.IsDir() {
+		return []string{source}
+	}
+	return nil
+}
+
+func splitOrdered(csv string) []string {
+	var out []string
+	for _, p := range strings.Split(csv, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func signalContext() (context.Context, context.CancelFunc) {
@@ -523,6 +569,7 @@ func cmdRun(args []string) int {
 	}
 	ctx, cancel := signalContext()
 	defer cancel()
+	f.source = pos[0]
 	suite, defTarget, err := buildSuite(ctx, pos[0], &g)
 	if err != nil {
 		return fail(err)
@@ -610,7 +657,7 @@ func execute(ctx context.Context, suite *model.Suite, defTarget string, f *runFl
 	color := !f.noColor && os.Getenv("NO_COLOR") == "" && isTTY(os.Stdout)
 
 	cfg := runner.Config{
-		Target: target, Baseline: f.baseline, Headers: f.headers, AuthHeaders: extraAuth,
+		Target: target, GRPCTarget: f.grpc, Protos: f.protoPaths(f.source), Baseline: f.baseline, Headers: f.headers, AuthHeaders: extraAuth,
 		Concurrency: f.concurrency, Rate: f.rate, Timeout: f.timeout, AllowRemote: f.allowRemote,
 		UserAgent: "ReplayHarness/" + version,
 		Check:     check.Options{Slow: f.slow, Exact: f.exact, Ignore: ignore},
@@ -635,7 +682,7 @@ func execute(ctx context.Context, suite *model.Suite, defTarget string, f *runFl
 		return fail(err)
 	}
 	rep := report.Build(results, suite.API, report.Options{
-		Version: version, Target: target, Baseline: f.baseline, Headers: f.headers, AuthHeaders: auth,
+		Version: version, Target: target, GRPCTarget: grpcRepro(target, f.grpc), Baseline: f.baseline, Headers: f.headers, AuthHeaders: auth,
 		Started: started, Duration: time.Since(started), Interrupted: interrupted,
 	})
 	report.WriteText(os.Stdout, rep, report.TextOptions{Color: color, Verbose: f.verbose})
@@ -740,7 +787,7 @@ func cmdContext(args []string) int {
 	} else if api, _, err = loadAPI(ctx, pos[0]); err != nil {
 		return fail(err)
 	}
-	fmt.Print(agent.Context(api, *target))
+	fmt.Print(agent.Context(api, *target, ""))
 	if *format {
 		fmt.Printf("\n## Writing replays\n\n%s\n", agent.ReplayFormat)
 	}
@@ -779,6 +826,7 @@ func cmdReplays(args []string) int {
 		return 0
 	}
 	client, err := runner.NewClient(f.target, runner.Config{
+		GRPCTarget: f.grpc, Protos: f.protoPaths("."),
 		Headers: f.headers, AuthHeaders: splitList(f.authHeaders), Rate: f.rate, Timeout: f.timeout,
 		AllowRemote: f.allowRemote, UserAgent: "ReplayHarness/" + version,
 	}, nil)
@@ -822,11 +870,20 @@ func cmdMCP(args []string) int {
 		return 2
 	}
 	if f.target == "" {
-		fmt.Fprintln(os.Stderr, "usage: replayharness mcp --target http://localhost:8080 [--source .] [-H 'Authorization: Bearer ...']")
+		fmt.Fprintln(os.Stderr, "usage: replayharness mcp --target http://localhost:8080 [--grpc localhost:9090] [--source .] [-H 'Authorization: Bearer ...']")
 		return 2
 	}
-	if _, err := runner.CheckTarget(f.target, f.allowRemote); err != nil {
+	httpTarget, grpcTarget := runner.SplitTarget(f.target)
+	if _, err := runner.CheckTarget(httpTarget, f.allowRemote); err != nil {
 		return fail(err)
+	}
+	if f.grpc == "" {
+		f.grpc = grpcTarget
+	}
+	if f.grpc != "" {
+		if err := runner.CheckGRPCTarget(f.grpc, f.allowRemote); err != nil {
+			return fail(err)
+		}
 	}
 	ctx, cancel := signalContext()
 	defer cancel()
@@ -835,7 +892,8 @@ func cmdMCP(args []string) int {
 		Source:  *source,
 		Slow:    f.slow,
 		Config: runner.Config{
-			Target: f.target, Headers: f.headers, AuthHeaders: splitList(f.authHeaders), Concurrency: f.concurrency,
+			Target: httpTarget, GRPCTarget: f.grpc, Protos: f.protoPaths(*source),
+			Headers: f.headers, AuthHeaders: splitList(f.authHeaders), Concurrency: f.concurrency,
 			Rate: f.rate, Timeout: f.timeout, AllowRemote: f.allowRemote, UserAgent: "ReplayHarness/" + version,
 		},
 	}

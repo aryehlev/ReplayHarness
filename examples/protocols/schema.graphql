@@ -1,0 +1,28 @@
+# The demo GraphQL schema. The resolvers are in graphql.go.
+type Query {
+  "One product by id."
+  product(id: Int!): Product
+  "Products, optionally in one category; at most limit of them."
+  products(category: String, limit: Int = 10): [Product!]!
+}
+
+type Mutation {
+  "Adds a review; rating must be 1 to 5."
+  addReview(productId: Int!, rating: Int!, text: String!): Review!
+  "Deletes a product. Needs the admin token."
+  deleteProduct(id: Int!): Boolean!
+}
+
+type Product {
+  id: Int!
+  name: String!
+  category: String!
+  priceCents: Int!
+  reviews: [Review!]!
+}
+
+type Review {
+  id: Int!
+  rating: Int!
+  text: String!
+}

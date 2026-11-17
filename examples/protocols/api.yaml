@@ -1,0 +1,87 @@
+# The API map a discovery agent wrote for this service by reading grpc.go,
+# graphql.go, ws.go, orders.proto and schema.graphql. In a project it lives
+# at .replayharness/api.yaml. ReplayHarness merges it with what the .proto
+# file and the GraphQL schema already say, and adds the WebSocket, which no
+# schema describes.
+#
+#   replayharness context examples/protocols/api.yaml
+#   replayharness run examples/protocols/api.yaml --target http://127.0.0.1:8081 --grpc 127.0.0.1:9091
+name: Protocols demo
+notes:
+  - gRPC listens on its own port (127.0.0.1:9091 in cmd/protocols-demo); GraphQL and the WebSocket share the HTTP port.
+  - The gRPC server turns a panic into INTERNAL with the stack trace in the message (grpc.go:107).
+  - GraphQL turns a panicking resolver into "internal system error" with status 200, like gqlgen (graphql.go:106).
+endpoints:
+  - grpc: orders.v1.Orders/CreateOrder
+    handler: grpc.go:159
+    body:
+      example: {customer: ada, items: [{sku: BOOK-1, qty: 2, price_cents: 1500}]}
+      required: [customer, items]
+      fields: {customer: {min_length: 1}, "items[].qty": {min: 1}}
+    rules:
+      - customer is REQUIRED in orders.proto but never checked (grpc.go:160)
+      - total_cents from the request replaces the total computed from the items (grpc.go:172)
+
+  - grpc: orders.v1.Orders/GetOrder
+    handler: grpc.go:194
+    body: {example: {id: 1}, required: [id]}
+    rules:
+      - an unknown id returns a plain Go error, so the code is UNKNOWN instead of NOT_FOUND (grpc.go:198)
+
+  - grpc: orders.v1.Orders/ListOrders
+    handler: grpc.go:204
+    body: {example: {page_size: 10}}
+    rules:
+      - page_size is never range-checked; a negative one panics at matched[:size] (grpc.go:220)
+
+  - grpc: orders.v1.Orders/CancelOrder
+    handler: grpc.go:231
+    body: {example: {id: 2}, required: [id]}
+    rules:
+      - cancelling an order that is already cancelled succeeds again instead of FAILED_PRECONDITION (grpc.go:236)
+
+  - grpc: orders.v1.Orders/WatchOrders
+    stream: server
+    handler: grpc.go:243
+    body: {example: {customer: ada}}
+
+  - graphql: query product
+    handler: graphql.go:182
+    rules:
+      - ids above the last product give null, but id 0 or below indexes c.products[id-1] and panics (graphql.go:187)
+
+  - graphql: query products
+    handler: graphql.go:189
+    body: {example: {limit: 2}}
+    rules:
+      - limit is never range-checked; a negative one panics at out[:limit] (graphql.go:201)
+
+  - graphql: mutation addReview
+    handler: graphql.go:204
+    body:
+      example: {productId: 1, rating: 5, text: Great pen}
+      fields: {rating: {min: 1, max: 5}}
+    rules:
+      - the schema says rating is 1 to 5, but it is never checked (graphql.go:209)
+
+  - graphql: mutation deleteProduct
+    handler: graphql.go:215
+    auth: true
+    rules:
+      - should need the admin token, but never reads it (graphql.go:216)
+      - the handler runs mutations sent with GET, so a link can delete a product (graphql.go:53)
+
+  - websocket: /ws/chat
+    handler: ws.go:24
+    body:
+      example: {type: join, room: general, name: ada}
+    rules:
+      - "join answers {type: joined, room, members}; members still counts clients that left (ws.go:32)"
+      - a message that is not a JSON object panics at msg["type"].(string) and drops the connection (ws.go:40)
+      - a room name over 100 characters closes the socket with 1011 internal error (ws.go:49)
+      - "say before join answers {type: error} (ws.go:64)"
+
+  - method: GET
+    path: /health
+    handler: protocols.go:17
+    responses: {"200": '{"status": "ok"}'}

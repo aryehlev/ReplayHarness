@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -19,6 +20,7 @@ import (
 type Options struct {
 	Version     string
 	Target      string
+	GRPCTarget  string // host:port (or grpcs://host:port) for gRPC repro commands
 	Baseline    string
 	Headers     map[string]string // global headers, shown redacted in repro commands
 	AuthHeaders map[string]bool
@@ -53,19 +55,20 @@ type Summary struct {
 
 // Report is the full outcome of a run.
 type Report struct {
-	Tool        string         `json:"tool"`
-	Version     string         `json:"version"`
-	Target      string         `json:"target"`
-	Baseline    string         `json:"baseline,omitempty"`
-	StartedAt   time.Time      `json:"startedAt"`
-	DurationMS  int64          `json:"durationMs"`
-	Interrupted bool           `json:"interrupted,omitempty"`
-	Summary     Summary        `json:"summary"`
-	Findings    []Group        `json:"findings"`
-	Endpoints   []string       `json:"endpoints"`
-	Drift       []model.Drift  `json:"drift,omitempty"`
-	Notes       []string       `json:"notes,omitempty"`
-	Results     []model.Result `json:"results"`
+	Tool        string            `json:"tool"`
+	Version     string            `json:"version"`
+	Target      string            `json:"target"`
+	Baseline    string            `json:"baseline,omitempty"`
+	StartedAt   time.Time         `json:"startedAt"`
+	DurationMS  int64             `json:"durationMs"`
+	Interrupted bool              `json:"interrupted,omitempty"`
+	Summary     Summary           `json:"summary"`
+	Findings    []Group           `json:"findings"`
+	Endpoints   []string          `json:"endpoints"`
+	Labels      map[string]string `json:"labels,omitempty"` // endpoint -> how to show it, e.g. "gRPC users.v1.Users/GetUser"
+	Drift       []model.Drift     `json:"drift,omitempty"`
+	Notes       []string          `json:"notes,omitempty"`
+	Results     []model.Result    `json:"results"`
 }
 
 // Build groups the findings of a run.
@@ -77,6 +80,14 @@ func Build(results []model.Result, api *model.API, o Options) *Report {
 	}
 	if api != nil {
 		rep.Drift, rep.Notes = api.Drift, api.Notes
+		for _, ep := range api.Endpoints {
+			if l := ep.Label(); l != ep.Key() {
+				if rep.Labels == nil {
+					rep.Labels = map[string]string{}
+				}
+				rep.Labels[ep.Key()] = l
+			}
+		}
 	}
 	type key struct{ ep, check, msg string }
 	index := map[key]int{}
@@ -96,7 +107,7 @@ func Build(results []model.Result, api *model.API, o Options) *Report {
 			}
 			index[k] = len(rep.Findings)
 			g := Group{Endpoint: ep, Check: f.Check, Severity: f.Severity, Message: f.Message, Count: 1,
-				Example: r.Scenario.Name, ScenarioID: r.Scenario.ID, Detail: f.Detail, Repro: Curl(o, r.Scenario)}
+				Example: r.Scenario.Name, ScenarioID: r.Scenario.ID, Detail: f.Detail, Repro: Command(o, r.Scenario)}
 			if len(r.Observed) > 0 {
 				g.Status = r.Observed[0].Status
 			}
@@ -146,6 +157,126 @@ func (r *Report) Failed(failOn string) bool {
 	return r.Summary.Errors > 0
 }
 
+// Command renders a scenario as a shell command that reproduces it: curl for
+// HTTP and GraphQL, grpcurl for gRPC, websocat for WebSocket. Credentials are
+// redacted.
+func Command(o Options, sc model.Scenario) string {
+	switch sc.Request.Protocol {
+	case model.ProtoGRPC:
+		return grpcurl(o, sc)
+	case model.ProtoWebSocket:
+		return websocat(o, sc)
+	}
+	return Curl(o, sc)
+}
+
+// headerArgs lists the headers to show, global ones first, with credentials
+// redacted.
+func headerArgs(o Options, sc model.Scenario, flag string, lower bool) []string {
+	var parts, names []string
+	for k := range o.Headers {
+		if sc.StripAuth && o.AuthHeaders[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		if _, overridden := sc.Request.Headers[k]; !overridden {
+			names = append(names, k)
+		}
+	}
+	sort.Strings(names)
+	name := func(k string) string {
+		if lower {
+			return strings.ToLower(k)
+		}
+		return k
+	}
+	for _, k := range names {
+		v := o.Headers[k]
+		if o.AuthHeaders[http.CanonicalHeaderKey(k)] {
+			v = "<redacted>"
+		}
+		parts = append(parts, flag, shellQuote(name(k)+": "+v))
+	}
+	names = names[:0]
+	for k := range sc.Request.Headers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		parts = append(parts, flag, shellQuote(name(k)+": "+sc.Request.Headers[k]))
+	}
+	return parts
+}
+
+func grpcurl(o Options, sc model.Scenario) string {
+	addr := o.GRPCTarget
+	parts := []string{"grpcurl"}
+	switch {
+	case strings.HasPrefix(addr, "grpcs://"):
+		addr = strings.TrimPrefix(addr, "grpcs://")
+	default:
+		addr = strings.TrimPrefix(addr, "grpc://")
+		parts = append(parts, "-plaintext")
+	}
+	if addr == "" {
+		if u, err := url.Parse(o.Target); err == nil {
+			addr = u.Host
+		}
+	}
+	parts = append(parts, headerArgs(o, sc, "-H", true)...)
+	body := sc.Request.Body
+	if body == "" {
+		body = "{}"
+	}
+	method := strings.TrimPrefix(sc.Request.Path, "/")
+	if len(body) > 2000 {
+		parts = append(parts, "-d", "@", addr, method, "< message.json", fmt.Sprintf("# %d-byte message: see scenario %s in the JSON report", len(body), sc.ID))
+		return strings.Join(parts, " ")
+	}
+	parts = append(parts, "-d", shellQuote(body), addr, method)
+	return strings.Join(parts, " ")
+}
+
+func websocat(o Options, sc model.Scenario) string {
+	u := o.Target
+	if base, err := url.Parse(o.Target); err == nil {
+		u = wsURL(base, sc.Request)
+	}
+	var msgs []any
+	_ = json.Unmarshal([]byte(sc.Request.Body), &msgs)
+	var lines []string
+	for _, m := range msgs {
+		text, ok := m.(string)
+		if !ok {
+			b, _ := json.Marshal(m)
+			text = string(b)
+		}
+		if len(text) > 2000 {
+			return fmt.Sprintf("websocat %s  # sends a %d-byte message: see scenario %s in the JSON report", shellQuote(u), len(text), sc.ID)
+		}
+		lines = append(lines, shellQuote(text))
+	}
+	parts := []string{}
+	if len(lines) > 0 {
+		parts = append(parts, "printf '%s\\n'", strings.Join(lines, " "), "|")
+	}
+	parts = append(parts, "websocat")
+	parts = append(parts, headerArgs(o, sc, "-H", false)...)
+	return strings.Join(append(parts, shellQuote(u)), " ")
+}
+
+func wsURL(base *url.URL, req model.Request) string {
+	u := *base
+	u.Scheme = "ws"
+	if base.Scheme == "https" {
+		u.Scheme = "wss"
+	}
+	s := strings.TrimRight(u.String(), "/") + req.Path
+	if req.Query != "" {
+		s += "?" + req.Query
+	}
+	return s
+}
+
 // Curl renders a scenario as a curl command that reproduces it. Credentials
 // are redacted.
 func Curl(o Options, sc model.Scenario) string {
@@ -158,31 +289,7 @@ func Curl(o Options, sc model.Scenario) string {
 		parts = append(parts, "-X", sc.Request.Method)
 	}
 	parts = append(parts, shellQuote(u))
-	var names []string
-	for k := range o.Headers {
-		if sc.StripAuth && o.AuthHeaders[http.CanonicalHeaderKey(k)] {
-			continue
-		}
-		if _, overridden := sc.Request.Headers[k]; !overridden {
-			names = append(names, k)
-		}
-	}
-	sort.Strings(names)
-	for _, k := range names {
-		v := o.Headers[k]
-		if o.AuthHeaders[http.CanonicalHeaderKey(k)] {
-			v = "<redacted>"
-		}
-		parts = append(parts, "-H", shellQuote(k+": "+v))
-	}
-	names = names[:0]
-	for k := range sc.Request.Headers {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	for _, k := range names {
-		parts = append(parts, "-H", shellQuote(k+": "+sc.Request.Headers[k]))
-	}
+	parts = append(parts, headerArgs(o, sc, "-H", false)...)
 	body := sc.Request.BodyBytes()
 	switch {
 	case len(body) == 0:
@@ -284,7 +391,7 @@ func WriteText(w io.Writer, r *Report, o TextOptions) {
 		byEndpoint[g.Endpoint] = append(byEndpoint[g.Endpoint], g)
 	}
 	for _, ep := range order {
-		fmt.Fprintf(w, "\n%s%s%s\n", c.bold, ep, c.reset)
+		fmt.Fprintf(w, "\n%s%s%s\n", c.bold, r.label(ep), c.reset)
 		for _, g := range byEndpoint[ep] {
 			mark, col := "✗", c.red
 			switch g.Severity {
@@ -313,7 +420,7 @@ func WriteText(w io.Writer, r *Report, o TextOptions) {
 	for _, ep := range r.Endpoints {
 		if _, ok := byEndpoint[ep]; !ok {
 			clean++
-			cleanNames = append(cleanNames, ep)
+			cleanNames = append(cleanNames, r.label(ep))
 		}
 	}
 	if clean > 0 {
@@ -344,6 +451,13 @@ func WriteText(w io.Writer, r *Report, o TextOptions) {
 		fmt.Fprintf(w, " %s(-v shows notes)%s", c.dim, c.reset)
 	}
 	fmt.Fprintln(w)
+}
+
+func (r *Report) label(ep string) string {
+	if l, ok := r.Labels[ep]; ok {
+		return l
+	}
+	return ep
 }
 
 func oneLine(s string, full bool) string {

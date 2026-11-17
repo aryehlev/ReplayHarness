@@ -62,7 +62,9 @@ func valid(s *model.Schema, name string, depth int) any {
 			return obj
 		}
 		for _, p := range s.PropertyNames() {
-			obj[p] = valid(s.Properties[p], p, depth+1)
+			if !excluded(s, p) {
+				obj[p] = valid(s.Properties[p], p, depth+1)
+			}
 		}
 		return obj
 	}
@@ -74,6 +76,19 @@ func valid(s *model.Schema, name string, depth int) any {
 		return obj
 	}
 	return "test"
+}
+
+// excluded reports whether a property is a oneof member other than the first
+// of its group, which a valid value leaves out.
+func excluded(s *model.Schema, name string) bool {
+	for _, group := range s.Exclusive {
+		for i, member := range group {
+			if member == name {
+				return i > 0
+			}
+		}
+	}
+	return false
 }
 
 func validString(s *model.Schema, name string) string {

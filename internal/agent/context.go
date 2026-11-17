@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aryehlev/ReplayHarness/internal/gql"
 	"github.com/aryehlev/ReplayHarness/internal/model"
 )
 
@@ -42,10 +43,46 @@ paths, query values, headers, bodies and expected values ($.id: "{{id}}"); a
 path may be just a saved path (path: "{{location}}").
 Built-in variables: {{unique}} (random per replay run), {{timestamp}} (unix ms).
 Without expect.status any status below 500 passes. A 5xx, a dropped connection,
-a timeout or a leaked stack trace fails a step even when no assertion mentions it.`
+a timeout or a leaked stack trace fails a step even when no assertion mentions it.
 
-// Context renders the API for an agent.
-func Context(api *model.API, target string) string {
+Other protocols: a step has grpc, graphql or websocket instead of method and path.
+
+  gRPC:
+    - grpc: users.v1.Users/GetUser
+      message: {id: "{{id}}"}              # the request as JSON, field names as in the .proto
+      headers: {authorization: "Bearer x"} # metadata
+      expect: {code: NOT_FOUND, json: {$.message: "<string>"}}
+  messages: [{...}, {...}] sends a client stream; a server stream's reply is a JSON
+  array. expect.code takes OK, INVALID_ARGUMENT, NOT_FOUND, ... or a list. An error's
+  body is {code, message, details}. int64 fields come back as strings ("42"), the
+  way protojson writes them. save: {c: code} keeps the code.
+
+  GraphQL:
+    - graphql: "query ($id: ID!) { user(id: $id) { id email } }"
+      variables: {id: "{{id}}"}
+      path: /graphql                       # the default; method POST (or GET)
+      expect: {json: {$.data.user.email: "<string>"}}
+  A response with errors fails the step unless expect.json mentions $.errors, e.g.
+  {"$.errors[0].message": "<string>", $.data.user: "<null>"}. In YAML flow maps,
+  quote keys that contain [ ].
+
+  WebSocket:
+    - websocket: /ws/chat?room=1
+      send: [{type: join}, "plain text"]   # strings are sent as they are, the rest as JSON
+      receive: 2                           # wait for 2 messages; fewer fails the step
+      wait_ms: 1000                        # without receive, collect for this long (default 1000)
+      expect: {status: 101, json: {"$[0].type": joined, $.length: 2}}
+  The body is the JSON array of messages received. expect.close is the close code
+  the server sent (1008, 4401, ...); expect.status is the handshake status (101
+  once upgraded, 401 if refused).
+
+Built-in failures also cover gRPC INTERNAL, UNKNOWN and DATA_LOSS, GraphQL errors
+that look like crashes ("internal system error", a stack trace, "index out of
+range"), and a WebSocket closed with 1011 or dropped without a close frame.`
+
+// Context renders the API for an agent. grpcAddr is where gRPC calls go,
+// if the API has gRPC methods.
+func Context(api *model.API, target, grpcAddr string) string {
 	var b strings.Builder
 	title := api.Title
 	if title == "" {
@@ -58,13 +95,30 @@ func Context(api *model.API, target string) string {
 	if target != "" {
 		fmt.Fprintf(&b, "Requests go to: %s (fixed; paths in replays start with /)\n", target)
 	}
+	if grpcAddr != "" && hasProtocol(api, model.ProtoGRPC) {
+		fmt.Fprintf(&b, "gRPC calls go to: %s\n", grpcAddr)
+	}
 	b.WriteString("\n")
 	for _, ep := range api.Endpoints {
-		method := ep.Method
-		if ep.AnyMethod {
-			method = "ANY"
+		switch ep.Protocol {
+		case model.ProtoGRPC:
+			fmt.Fprintf(&b, "## %s\n", ep.Label())
+		case model.ProtoGraphQL:
+			sig := ep.GraphQL.Field
+			if len(ep.GraphQL.ArgOrder) > 0 {
+				var args []string
+				for _, a := range ep.GraphQL.ArgOrder {
+					args = append(args, a+": "+ep.GraphQL.ArgTypes[a])
+				}
+				sig += "(" + strings.Join(args, ", ") + ")"
+			}
+			if ep.GraphQL.Returns != "" {
+				sig += ": " + ep.GraphQL.Returns
+			}
+			fmt.Fprintf(&b, "## GraphQL %s %s (POST %s)\n", ep.GraphQL.Operation, sig, ep.Path)
+		default:
+			fmt.Fprintf(&b, "## %s\n", ep.Label())
 		}
-		fmt.Fprintf(&b, "## %s %s\n", method, ep.Path)
 		switch {
 		case ep.Code != "":
 			fmt.Fprintf(&b, "- handler registered at: %s\n", ep.Code)
@@ -72,31 +126,52 @@ func Context(api *model.API, target string) string {
 			fmt.Fprintf(&b, "- found in the code by pattern matching (%s)\n", ep.Source)
 		case ep.Inferred:
 			fmt.Fprintf(&b, "- seen in: %s\n", ep.Source)
+		case ep.Protocol != "" && ep.Source != "":
+			fmt.Fprintf(&b, "- defined at %s; handler not located yet (read the code and add it to the API map)\n", ep.Source)
 		default:
 			fmt.Fprintf(&b, "- handler: not found in the code (documented in %s)\n", ep.Source)
 		}
 		if ep.Secured {
 			b.WriteString("- auth: required\n")
 		}
-		for _, p := range ep.Params {
-			req := ""
-			if p.Required {
-				req = ", required"
-			}
-			fmt.Fprintf(&b, "- %s param %s: %s%s\n", p.In, p.Name, Schema(p.Schema), req)
-		}
-		if ep.Body != nil || ep.BodyType != "" {
-			req := ""
-			if ep.BodyRequired {
-				req = ", required"
-			}
-			body := "shape unknown (read the handler)"
+		switch ep.Protocol {
+		case model.ProtoGRPC:
 			if ep.Body != nil {
-				body = Schema(ep.Body)
+				fmt.Fprintf(&b, "- request %s: %s\n", typeName(ep.Body), Schema(ep.Body))
 			}
-			fmt.Fprintf(&b, "- body (%s%s): %s\n", ep.BodyType, req, body)
+			if ok := ep.Responses["OK"]; ok != nil && ok.Schema != nil {
+				fmt.Fprintf(&b, "- response %s: %s\n", typeName(ok.Schema), Schema(ok.Schema))
+			}
+		case model.ProtoGraphQL:
+			if ep.Body != nil && len(ep.Body.Properties) > 0 {
+				fmt.Fprintf(&b, "- variables: %s\n", Schema(ep.Body))
+			}
+			fmt.Fprintf(&b, "- query: %s\n", gql.Query(ep.GraphQL))
+		case model.ProtoWebSocket:
+			if ep.Body != nil {
+				fmt.Fprintf(&b, "- message: %s\n", Schema(ep.Body))
+			}
+		default:
+			for _, p := range ep.Params {
+				req := ""
+				if p.Required {
+					req = ", required"
+				}
+				fmt.Fprintf(&b, "- %s param %s: %s%s\n", p.In, p.Name, Schema(p.Schema), req)
+			}
+			if ep.Body != nil || ep.BodyType != "" {
+				req := ""
+				if ep.BodyRequired {
+					req = ", required"
+				}
+				body := "shape unknown (read the handler)"
+				if ep.Body != nil {
+					body = Schema(ep.Body)
+				}
+				fmt.Fprintf(&b, "- body (%s%s): %s\n", ep.BodyType, req, body)
+			}
 		}
-		if len(ep.Responses) > 0 {
+		if len(ep.Responses) > 0 && ep.Protocol != model.ProtoGRPC && ep.Protocol != model.ProtoGraphQL {
 			codes := make([]string, 0, len(ep.Responses))
 			for c := range ep.Responses {
 				codes = append(codes, c)
@@ -153,6 +228,22 @@ func Context(api *model.API, target string) string {
 	return b.String()
 }
 
+func hasProtocol(api *model.API, proto string) bool {
+	for _, ep := range api.Endpoints {
+		if ep.Protocol == proto {
+			return true
+		}
+	}
+	return false
+}
+
+func typeName(s *model.Schema) string {
+	if s.TypeName != "" {
+		return s.TypeName
+	}
+	return "message"
+}
+
 func fillPath(tmpl string, values map[string]string) string {
 	for k, v := range values {
 		tmpl = strings.ReplaceAll(tmpl, "{"+k+"}", v)
@@ -181,16 +272,35 @@ func schema(s *model.Schema, depth int) string {
 			break
 		}
 		var fields []string
+		inGroup := map[string]bool{}
+		for _, g := range s.Exclusive {
+			for _, n := range g {
+				inGroup[n] = true
+			}
+		}
 		for _, n := range s.PropertyNames() {
+			if inGroup[n] {
+				continue
+			}
 			name := n
 			if s.IsRequired(n) {
 				name += "*"
 			}
 			fields = append(fields, name+": "+schema(s.Properties[n], depth+1))
 		}
+		for _, g := range s.Exclusive {
+			var alts []string
+			for _, n := range g {
+				alts = append(alts, n+": "+schema(s.Properties[n], depth+1))
+			}
+			fields = append(fields, "one of ("+strings.Join(alts, " | ")+")")
+		}
 		out = "{" + strings.Join(fields, ", ") + "}"
 		if len(fields) == 0 {
 			out = "object"
+			if s.TypeName != "" && depth > 0 {
+				out = s.TypeName
+			}
 		}
 	case s.Type == "array":
 		out = "[" + schema(s.Items, depth+1) + "]" + bounds(intf(s.MinItems), intf(s.MaxItems), " items")
@@ -204,7 +314,11 @@ func schema(s *model.Schema, depth int) string {
 			out += " matching " + s.Pattern
 		}
 	case s.Type == "integer" || s.Type == "number":
-		out = s.Type + bounds(s.Minimum, s.Maximum, "")
+		out = s.Type
+		if s.Format != "" {
+			out += "<" + s.Format + ">"
+		}
+		out += bounds(s.Minimum, s.Maximum, "")
 	case s.Type == "":
 		out = "any"
 	default:
