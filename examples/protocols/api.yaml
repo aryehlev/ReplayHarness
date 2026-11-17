@@ -13,62 +13,62 @@ notes:
   - GraphQL turns a panicking resolver into "internal system error" with status 200, like gqlgen (graphql.go:106).
 endpoints:
   - grpc: orders.v1.Orders/CreateOrder
-    handler: grpc.go:159
+    handler: grpc.go:163
     body:
       example: {customer: ada, items: [{sku: BOOK-1, qty: 2, price_cents: 1500}]}
       required: [customer, items]
       fields: {customer: {min_length: 1}, "items[].qty": {min: 1}}
     rules:
-      - customer is REQUIRED in orders.proto but never checked (grpc.go:160)
-      - total_cents from the request replaces the total computed from the items (grpc.go:172)
+      - customer is REQUIRED in orders.proto but never checked (grpc.go:164)
+      - total_cents from the request replaces the total computed from the items (grpc.go:176)
 
   - grpc: orders.v1.Orders/GetOrder
-    handler: grpc.go:194
+    handler: grpc.go:198
     body: {example: {id: 1}, required: [id]}
     rules:
-      - an unknown id returns a plain Go error, so the code is UNKNOWN instead of NOT_FOUND (grpc.go:198)
+      - an unknown id returns a plain Go error, so the code is UNKNOWN instead of NOT_FOUND (grpc.go:202)
 
   - grpc: orders.v1.Orders/ListOrders
-    handler: grpc.go:204
+    handler: grpc.go:208
     body: {example: {page_size: 10}}
     rules:
-      - page_size is never range-checked; a negative one panics at matched[:size] (grpc.go:220)
+      - page_size is never range-checked; a negative one panics at matched[:size] (grpc.go:224)
 
   - grpc: orders.v1.Orders/CancelOrder
-    handler: grpc.go:231
+    handler: grpc.go:235
     body: {example: {id: 2}, required: [id]}
     rules:
-      - cancelling an order that is already cancelled succeeds again instead of FAILED_PRECONDITION (grpc.go:236)
+      - cancelling an order that is already cancelled succeeds again instead of FAILED_PRECONDITION (grpc.go:240)
 
   - grpc: orders.v1.Orders/WatchOrders
     stream: server
-    handler: grpc.go:243
+    handler: grpc.go:247
     body: {example: {customer: ada}}
 
   - graphql: query product
-    handler: graphql.go:182
+    handler: graphql.go:183
     rules:
-      - ids above the last product give null, but id 0 or below indexes c.products[id-1] and panics (graphql.go:187)
+      - ids above the last product give null, but id 0 or below indexes c.products[id-1] and panics (graphql.go:188)
 
   - graphql: query products
-    handler: graphql.go:189
+    handler: graphql.go:190
     body: {example: {limit: 2}}
     rules:
-      - limit is never range-checked; a negative one panics at out[:limit] (graphql.go:201)
+      - limit is never range-checked; a negative one panics at out[:limit] (graphql.go:202)
 
   - graphql: mutation addReview
-    handler: graphql.go:204
+    handler: graphql.go:205
     body:
       example: {productId: 1, rating: 5, text: Great pen}
       fields: {rating: {min: 1, max: 5}}
     rules:
-      - the schema says rating is 1 to 5, but it is never checked (graphql.go:209)
+      - the schema says rating is 1 to 5, but it is never checked (graphql.go:210)
 
   - graphql: mutation deleteProduct
-    handler: graphql.go:215
+    handler: graphql.go:216
     auth: true
     rules:
-      - should need the admin token, but never reads it (graphql.go:216)
+      - should need the admin token, but never reads it (graphql.go:217)
       - the handler runs mutations sent with GET, so a link can delete a product (graphql.go:53)
 
   - websocket: /ws/chat

@@ -136,7 +136,11 @@ func field(m *dynamicpb.Message, name string) protoreflect.Value {
 	return m.Get(m.Descriptor().Fields().ByName(protoreflect.Name(name)))
 }
 
-func (s *ordersService) toProto(o *order) *dynamicpb.Message {
+func (s *ordersService) toProto(live *order) *dynamicpb.Message {
+	s.mu.Lock()
+	o := *live
+	o.Items = append([]item(nil), live.Items...)
+	s.mu.Unlock()
 	md := s.method("GetOrder").Output()
 	m := dynamicpb.NewMessage(md)
 	set := func(name string, v protoreflect.Value) { m.Set(md.Fields().ByName(protoreflect.Name(name)), v) }

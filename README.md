@@ -239,7 +239,7 @@ replayharness replay examples/protocols/replays.yaml --target http://127.0.0.1:8
 
 ```text
 ✗ an unknown order is NOT_FOUND
-    why: getOrder returns a plain error for a missing order, which gRPC sends as UNKNOWN (grpc.go:198)
+    why: getOrder returns a plain error for a missing order, which gRPC sends as UNKNOWN (grpc.go:202)
     1. gRPC orders.v1.Orders/GetOrder → UNKNOWN FAIL
        - code UNKNOWN ("sql: no rows in result set (order 999999)"), expected NOT_FOUND
        grpcurl -plaintext -d '{"id":999999}' 127.0.0.1:9091 orders.v1.Orders/GetOrder

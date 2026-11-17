@@ -110,6 +110,9 @@ func (c *catalog) execute(r *http.Request, query string, variables map[string]an
 			resp = map[string]any{"data": nil, "errors": []any{map[string]any{"message": "internal system error", "path": []any{}}}}
 		}
 	}()
+	// Resolvers return the stored maps, so the whole operation holds the lock.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	e := &executor{c: c, r: r, vars: vars, frags: doc.Fragments}
 	return map[string]any{"data": e.selectionSet(op.SelectionSet, nil, root)}
 }
@@ -176,8 +179,6 @@ func (e *executor) complete(v any, set ast.SelectionSet, typ string) any {
 
 func (e *executor) root(typ, field string, args map[string]any) any {
 	c := e.c
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	switch typ + "." + field {
 	case "Query.product":
 		id := toInt(args["id"])

@@ -17,35 +17,35 @@ replays:
         expect: {code: OK, json: {$.id: "{{id}}", $.total_cents: "900"}}
 
   - name: an order's total comes from its items
-    why: createOrder lets total_cents from the request replace the computed total (grpc.go:172)
+    why: createOrder lets total_cents from the request replace the computed total (grpc.go:176)
     steps:
       - grpc: orders.v1.Orders/CreateOrder
         message: {customer: eve, items: [{sku: BOOK-1, qty: 2, price_cents: 1500}], total_cents: 1}
         expect: {code: OK, json: {$.total_cents: "3000"}}   # int64 comes back as a string
 
   - name: an order without a customer is rejected
-    why: customer is REQUIRED in orders.proto, but createOrder never checks it (grpc.go:160)
+    why: customer is REQUIRED in orders.proto, but createOrder never checks it (grpc.go:164)
     steps:
       - grpc: orders.v1.Orders/CreateOrder
         message: {items: [{sku: PEN-9, qty: 1, price_cents: 250}]}
         expect: {code: INVALID_ARGUMENT}
 
   - name: an unknown order is NOT_FOUND
-    why: getOrder returns a plain error for a missing order, which gRPC sends as UNKNOWN (grpc.go:198)
+    why: getOrder returns a plain error for a missing order, which gRPC sends as UNKNOWN (grpc.go:202)
     steps:
       - grpc: orders.v1.Orders/GetOrder
         message: {id: 999999}
         expect: {code: NOT_FOUND}
 
   - name: a negative page size is rejected
-    why: listOrders slices matched[:size] without checking size (grpc.go:220)
+    why: listOrders slices matched[:size] without checking size (grpc.go:224)
     steps:
       - grpc: orders.v1.Orders/ListOrders
         message: {page_size: -1}
         expect: {code: INVALID_ARGUMENT}
 
   - name: a cancelled order cannot be cancelled again
-    why: cancelOrder sets the status without checking it (grpc.go:236)
+    why: cancelOrder sets the status without checking it (grpc.go:240)
     steps:
       - grpc: orders.v1.Orders/CreateOrder
         message: {customer: dan, items: [{sku: INK-2, qty: 1, price_cents: 400}]}
@@ -71,25 +71,25 @@ replays:
         expect: {status: 200, json: {$.data.product.name: Notebook}}
 
   - name: product 0 is null, not a crash
-    why: product indexes c.products[id-1] without checking id >= 1 (graphql.go:187)
+    why: product indexes c.products[id-1] without checking id >= 1 (graphql.go:188)
     steps:
       - graphql: "{ product(id: 0) { id name } }"
         expect: {json: {$.data.product: "<null>"}}
 
   - name: a negative limit is rejected
-    why: products slices out[:limit] without checking limit (graphql.go:201)
+    why: products slices out[:limit] without checking limit (graphql.go:202)
     steps:
       - graphql: "{ products(limit: -1) { id } }"
         expect: {json: {"$.errors[0].message": "<string>"}}
 
   - name: a rating above 5 is rejected
-    why: addReview stores any rating, though the schema says 1 to 5 (graphql.go:209)
+    why: addReview stores any rating, though the schema says 1 to 5 (graphql.go:210)
     steps:
       - graphql: "mutation { addReview(productId: 1, rating: 9, text: \"spam\") { id rating } }"
         expect: {json: {$.errors: "<nonempty>"}}
 
   - name: deleting a product needs the admin token
-    why: deleteProduct never reads the Authorization header (graphql.go:216)
+    why: deleteProduct never reads the Authorization header (graphql.go:217)
     steps:
       - graphql: "mutation { deleteProduct(id: 3) }"
         no_auth: true

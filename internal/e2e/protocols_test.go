@@ -133,7 +133,7 @@ func TestProtocolProbes(t *testing.T) {
 	if len(api.Drift) != 0 {
 		t.Errorf("unexpected drift: %+v", api.Drift)
 	}
-	if ep := api.Endpoint("GRPC /orders.v1.Orders/CreateOrder"); ep == nil || ep.Code != "grpc.go:159" || !ep.Body.IsRequired("customer") {
+	if ep := api.Endpoint("GRPC /orders.v1.Orders/CreateOrder"); ep == nil || ep.Code != "grpc.go:163" || !ep.Body.IsRequired("customer") {
 		t.Errorf("the map was not merged into the .proto endpoint: %+v", ep)
 	}
 
